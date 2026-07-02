@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 import pytest
 
-from rcc.config import Profile
+from rcc.config import DockerSpec, Profile
 from rcc.errors import MissingDependencyError, RemoteError
 from rcc.ssh import (
     ensure_remote_dir,
@@ -110,6 +110,32 @@ def test_run_remote_passes_env_and_cwd(fake_run):
     assert "cd -- /srv/app/sub" in joined
 
 
+def test_run_remote_threads_docker_target(fake_run):
+    fake_run.return_value = subprocess.CompletedProcess(args=[], returncode=0)
+    run_remote(
+        make_profile(),
+        ["python", "train.py"],
+        env={"REMOTE": "1"},
+        docker=DockerSpec(image="img", env={"E": "2"}),
+    )
+    joined = fake_run.call_args.args[0][-1]
+    assert "export REMOTE=1;" in joined
+    assert "docker run --rm" in joined
+    assert "--env E=2" in joined
+    assert "img python train.py" in joined
+
+
+def test_run_remote_capture_threads_docker_target(fake_run):
+    fake_run.return_value = subprocess.CompletedProcess(
+        args=[], returncode=0, stdout="ok", stderr=""
+    )
+    result = run_remote_capture(make_profile(), ["python", "-V"], docker=DockerSpec(image="img"))
+    assert result.stdout == "ok"
+    joined = fake_run.call_args.args[0][-1]
+    assert "docker run --rm" in joined
+    assert "img python -V" in joined
+
+
 def test_mux_check_returns_true_when_open(fake_run):
     fake_run.return_value = subprocess.CompletedProcess(args=[], returncode=0)
     assert mux_check(make_profile()) is True
@@ -152,11 +178,12 @@ def test_run_remote_uses_paramiko_when_ssh_missing(monkeypatch):
     monkeypatch.setattr("rcc.ssh.shutil.which", lambda name: None)
     called = {}
 
-    def fake_fallback(profile, argv, *, script, tty, env=None, cwd=None):
+    def fake_fallback(profile, argv, *, script, tty, env=None, cwd=None, docker=None):
         called["profile"] = profile
         called["argv"] = argv
         called["script"] = script
         called["tty"] = tty
+        called["docker"] = docker
         return 0
 
     monkeypatch.setattr("rcc.ssh._paramiko_run_remote", fake_fallback)
@@ -164,6 +191,7 @@ def test_run_remote_uses_paramiko_when_ssh_missing(monkeypatch):
     assert called["argv"] == ["ls"]
     assert called["script"] is None
     assert called["tty"] is True
+    assert called["docker"] is None
 
 
 def test_mux_check_returns_false_when_ssh_missing(monkeypatch):

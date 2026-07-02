@@ -20,7 +20,7 @@ def config(
         None,
         "--get",
         metavar="KEY",
-        help="Print a single field (e.g. host, remote_dir, proxy_jump, env.NAME, tunnel.remote_port).",
+        help="Print a single field (e.g. host, remote_dir, env.NAME, tunnel.remote_port, docker.image).",
     ),
     profile: str | None = typer.Option(None, "--profile"),
     host: str | None = typer.Option(None, "--host"),
@@ -69,3 +69,33 @@ def config(
             f"local_port={resolved.tunnel.local_port}, "
             f"remote_host={resolved.tunnel.remote_host!r} }}"
         )
+    if resolved.docker is not None:
+        docker_parts = []
+        if resolved.docker.image:
+            docker_parts.append(f"image={resolved.docker.image!r}")
+        if resolved.docker.container:
+            docker_parts.append(f"container={resolved.docker.container!r}")
+        docker_parts.append(f"workdir={resolved.docker.workdir!r}")
+        docker_parts.append(f"rm={resolved.docker.rm!r}")
+        if resolved.docker.gpus:
+            docker_parts.append(f"gpus={resolved.docker.gpus!r}")
+        if resolved.docker.shm_size:
+            docker_parts.append(f"shm_size={resolved.docker.shm_size!r}")
+        if resolved.docker.network:
+            docker_parts.append(f"network={resolved.docker.network!r}")
+        if resolved.docker.args:
+            docker_parts.append(f"args={resolved.docker.args!r}")
+        typer.echo(f"docker = {{ {', '.join(docker_parts)} }}")
+        if resolved.docker.mounts:
+            typer.echo("docker.mounts = [")
+            for mount in resolved.docker.mounts:
+                typer.echo(
+                    f"    {{ source={mount.source!r}, target={mount.target!r}, "
+                    f"mode={mount.mode!r} }}"
+                )
+            typer.echo("]")
+        if resolved.docker.env:
+            typer.echo("docker.env = {")
+            for key in sorted(resolved.docker.env):
+                typer.echo(f"    {key} = {resolved.docker.env[key]!r}")
+            typer.echo("}")

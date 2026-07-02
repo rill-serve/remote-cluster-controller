@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 from rcc.config import (
+    DockerSpec,
     Profile,
     TunnelSpec,
     find_rcc_dir,
@@ -107,6 +108,7 @@ def test_profile_exports_expected_defaults():
     assert profile.env == {}
     assert profile.keep_remote == []
     assert profile.tunnel is None
+    assert profile.docker is None
 
 
 def _rich_config(tmp_path: Path) -> Path:
@@ -127,6 +129,23 @@ def _rich_config(tmp_path: Path) -> Path:
         "remote_port = 8080\n"
         "local_port = 18080\n"
         'remote_host = "head01"\n'
+        "[profiles.alpha.docker]\n"
+        'image = "pytorch/pytorch:runtime"\n'
+        'workdir = "/workspace"\n'
+        'gpus = "all"\n'
+        'shm_size = "16g"\n'
+        'network = "host"\n'
+        'args = ["--ipc=host"]\n'
+        "[[profiles.alpha.docker.mounts]]\n"
+        'source = "{remote_dir}"\n'
+        'target = "/workspace"\n'
+        'mode = "rw"\n'
+        "[[profiles.alpha.docker.mounts]]\n"
+        'source = "/scratch/datasets"\n'
+        'target = "/data"\n'
+        'mode = "ro"\n'
+        "[profiles.alpha.docker.env]\n"
+        'HF_HOME = "/workspace/.cache/huggingface"\n'
     )
     return project
 
@@ -143,6 +162,16 @@ def test_load_config_parses_rich_profile(tmp_path: Path):
     assert p.tunnel.remote_port == 8080
     assert p.tunnel.local_port == 18080
     assert p.tunnel.remote_host == "head01"
+    assert isinstance(p.docker, DockerSpec)
+    assert p.docker.image == "pytorch/pytorch:runtime"
+    assert p.docker.workdir == "/workspace"
+    assert p.docker.gpus == "all"
+    assert p.docker.shm_size == "16g"
+    assert p.docker.network == "host"
+    assert p.docker.args == ["--ipc=host"]
+    assert p.docker.mounts[0].source == "{remote_dir}"
+    assert p.docker.mounts[1].mode == "ro"
+    assert p.docker.env == {"HF_HOME": "/workspace/.cache/huggingface"}
 
 
 def test_load_config_tunnel_defaults_remote_host(tmp_path: Path):
@@ -191,6 +220,7 @@ def test_profile_to_dict_is_json_serializable(tmp_path: Path):
     round_tripped = json.loads(json.dumps(d))
     assert round_tripped["env"] == {"TRITON_CACHE_DIR": "/scratch/cache"}
     assert round_tripped["tunnel"]["remote_port"] == 8080
+    assert round_tripped["docker"]["mounts"][0]["target"] == "/workspace"
 
 
 def test_get_field_top_level_and_dotted(tmp_path: Path):
@@ -202,6 +232,9 @@ def test_get_field_top_level_and_dotted(tmp_path: Path):
     assert get_field(p, "env.TRITON_CACHE_DIR") == "/scratch/cache"
     assert get_field(p, "tunnel.remote_port") == "8080"
     assert get_field(p, "tunnel.remote_host") == "head01"
+    assert get_field(p, "docker.image") == "pytorch/pytorch:runtime"
+    assert get_field(p, "docker.workdir") == "/workspace"
+    assert get_field(p, "docker.env.HF_HOME") == "/workspace/.cache/huggingface"
 
 
 def test_get_field_missing_key_errors(tmp_path: Path):
@@ -211,3 +244,52 @@ def test_get_field_missing_key_errors(tmp_path: Path):
         get_field(p, "env.NOPE")
     with pytest.raises(ConfigError, match="unknown profile field"):
         get_field(p, "nope")
+    with pytest.raises(ConfigError, match="structured"):
+        get_field(p, "docker.mounts")
+
+
+def test_load_config_parses_docker_container_profile(tmp_path: Path):
+    project = tmp_path / "p"
+    rcc = project / ".rcc"
+    rcc.mkdir(parents=True)
+    (rcc / "config.toml").write_text(
+        'default = "a"\n[profiles.a]\nhost="h"\nremote_dir="/r"\n'
+        "[profiles.a.docker]\n"
+        'container = "devbox"\n'
+        'workdir = "/workspace"\n'
+    )
+    p = load_config(rcc / "config.toml").profiles["a"]
+    assert p.docker is not None
+    assert p.docker.container == "devbox"
+    assert p.docker.image is None
+
+
+def test_load_config_rejects_docker_image_and_container(tmp_path: Path):
+    project = tmp_path / "p"
+    rcc = project / ".rcc"
+    rcc.mkdir(parents=True)
+    (rcc / "config.toml").write_text(
+        'default = "a"\n[profiles.a]\nhost="h"\nremote_dir="/r"\n'
+        "[profiles.a.docker]\n"
+        'image = "img"\n'
+        'container = "devbox"\n'
+    )
+    with pytest.raises(ConfigError, match="mutually exclusive"):
+        load_config(rcc / "config.toml")
+
+
+def test_load_config_rejects_bad_docker_mount_mode(tmp_path: Path):
+    project = tmp_path / "p"
+    rcc = project / ".rcc"
+    rcc.mkdir(parents=True)
+    (rcc / "config.toml").write_text(
+        'default = "a"\n[profiles.a]\nhost="h"\nremote_dir="/r"\n'
+        "[profiles.a.docker]\n"
+        'image = "img"\n'
+        "[[profiles.a.docker.mounts]]\n"
+        'source = "/x"\n'
+        'target = "/y"\n'
+        'mode = "bad"\n'
+    )
+    with pytest.raises(ConfigError, match="ro"):
+        load_config(rcc / "config.toml")

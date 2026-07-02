@@ -1,5 +1,6 @@
-from rcc.config import Profile
+from rcc.config import DockerMount, DockerSpec, Profile
 from rcc.ssh import (
+    build_remote_docker_command,
     build_remote_command,
     build_remote_shell_command,
     build_rsync_e_string,
@@ -91,6 +92,54 @@ def test_build_remote_command_exports_env_before_cd():
 def test_build_remote_shell_command_exports_env():
     cmd = build_remote_shell_command("/srv/app", "$0", env={"X": "1"})
     assert "export X=1;" in cmd
+
+
+def test_build_remote_docker_command_runs_image_with_mounts_env_and_gpus():
+    target = DockerSpec(
+        image="pytorch/pytorch:runtime",
+        workdir="/workspace",
+        mounts=[
+            DockerMount(source="{remote_dir}", target="/workspace"),
+            DockerMount(source="/scratch/datasets", target="/data", mode="ro"),
+        ],
+        env={"HF_HOME": "/workspace/.cache/huggingface", "P": "a b"},
+        gpus="all",
+        shm_size="16g",
+        network="host",
+        args=["--ipc=host"],
+    )
+    cmd = build_remote_docker_command(
+        "/srv/my app", target, ["python", "train.py", "--x", "a b"], env={"REMOTE": "1"}
+    )
+    assert "export REMOTE=1;" in cmd
+    assert "cd -- '/srv/my app';" in cmd
+    assert "docker run --rm --gpus all --shm-size 16g --network host" in cmd
+    assert "--mount 'type=bind,src=/srv/my app,dst=/workspace'" in cmd
+    assert "--mount type=bind,src=/scratch/datasets,dst=/data,readonly" in cmd
+    assert "--workdir /workspace" in cmd
+    assert "--env HF_HOME=/workspace/.cache/huggingface" in cmd
+    assert "--env 'P=a b'" in cmd
+    assert "--ipc=host pytorch/pytorch:runtime python train.py --x 'a b'" in cmd
+
+
+def test_build_remote_docker_command_defaults_mount_to_remote_dir():
+    target = DockerSpec(image="img", workdir="/app")
+    cmd = build_remote_docker_command("/srv/app", target, ["pytest"])
+    assert "--mount type=bind,src=/srv/app,dst=/app" in cmd
+    assert "--workdir /app img pytest" in cmd
+
+
+def test_build_remote_docker_command_keeps_shell_snippet_inside_container():
+    target = DockerSpec(image="img")
+    cmd = build_remote_docker_command("/srv/app", target, [], script="echo $USER | head")
+    assert "img bash -lc 'echo $USER | head'" in cmd
+
+
+def test_build_remote_docker_command_execs_existing_container():
+    target = DockerSpec(container="devbox", workdir="/workspace", env={"E": "1"})
+    cmd = build_remote_docker_command("/srv/app", target, ["python", "-V"], tty=True)
+    assert "docker exec -it --workdir /workspace --env E=1 devbox python -V" in cmd
+    assert "docker run" not in cmd
 
 
 def test_proxy_jump_and_identity_file_in_ssh_args():

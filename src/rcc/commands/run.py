@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import dataclasses
 import json
 from pathlib import Path
 
 import typer
 
 from rcc import bg
-from rcc.config import find_rcc_dir, resolve_profile
+from rcc.config import DockerMount, DockerSpec, find_rcc_dir, resolve_profile
 from rcc.context import merge_cli_overrides
 from rcc.errors import ConfigError, RemoteError
 from rcc.ssh import run_remote, run_remote_tee
@@ -26,7 +27,7 @@ def run(
         "--env",
         metavar="KEY=VAL",
         help="Export KEY=VAL on the remote before the command (repeatable). "
-        "Merged on top of the profile's [env] defaults.",
+        "Merged on top of the profile env defaults.",
     ),
     env_file: Path | None = typer.Option(
         None,
@@ -60,6 +61,54 @@ def run(
         help="Stream output live AND write {returncode, stdout, stderr, command} to PATH "
         "on exit — so wrappers get both live output and the captured text (tee).",
     ),
+    docker: bool = typer.Option(
+        False,
+        "--docker",
+        help="Run through the profile docker target, or through Docker CLI overrides.",
+    ),
+    docker_image: str | None = typer.Option(
+        None,
+        "--docker-image",
+        help="Run in this image using Docker on the SSH remote host.",
+    ),
+    docker_container: str | None = typer.Option(
+        None,
+        "--docker-container",
+        help="Execute in this existing Docker container on the SSH remote host.",
+    ),
+    docker_workdir: str | None = typer.Option(
+        None,
+        "--docker-workdir",
+        help="Working directory inside the container (default: profile docker.workdir).",
+    ),
+    docker_mount: list[str] | None = typer.Option(
+        None,
+        "--docker-mount",
+        metavar="SRC:DST[:ro|rw]",
+        help="Add a docker run bind mount. SRC is a remote-host path; "
+        "{remote_dir} and {cwd} are expanded remotely.",
+    ),
+    docker_env: list[str] | None = typer.Option(
+        None,
+        "--docker-env",
+        metavar="KEY=VAL",
+        help="Set container-only KEY=VAL (repeatable). Overrides docker env and --env.",
+    ),
+    docker_gpus: str | None = typer.Option(
+        None,
+        "--docker-gpus",
+        help="Pass --gpus to docker run, e.g. all.",
+    ),
+    docker_shm_size: str | None = typer.Option(
+        None,
+        "--docker-shm-size",
+        help="Pass --shm-size to docker run, e.g. 16g.",
+    ),
+    docker_network: str | None = typer.Option(
+        None,
+        "--docker-network",
+        help="Pass --network to docker run, e.g. host.",
+    ),
     profile: str | None = typer.Option(None, "--profile"),
     host: str | None = typer.Option(None, "--host"),
     remote_dir: str | None = typer.Option(None, "--remote-dir"),
@@ -69,7 +118,9 @@ def run(
     By default the arguments after `--` are passed as separate tokens. Use
     -s/--shell to pass a shell snippet that may contain pipelines, variable
     expansion, or quotes. ``--env KEY=VAL`` / ``--env-file`` inject environment
-    on the remote (layered over the profile's ``[env]`` defaults).
+    on the remote (layered over the profile env defaults).
+    ``--docker`` runs the same command through the resolved profile's
+    Docker target; Docker CLI flags override the profile for one-off runs.
 
     ``--detach`` launches the command in a tmux session so it survives
     disconnects; manage it with ``rcc bg`` (issue #3 #2). ``--result-json PATH``
@@ -93,9 +144,27 @@ def run(
         host_override=overrides.host,
         remote_dir_override=overrides.remote_dir,
     )
-    merged_env = _resolve_env(resolved.env, env or [], env_file)
+    cli_env = _resolve_env({}, env or [], env_file)
+    merged_env = dict(resolved.env)
+    merged_env.update(cli_env)
+    docker_target = _resolve_docker_target(
+        resolved.docker,
+        enabled=docker,
+        image=docker_image,
+        container=docker_container,
+        workdir=docker_workdir,
+        mounts=docker_mount or [],
+        inherited_env=resolved.env,
+        cli_env=cli_env,
+        docker_env_flags=docker_env or [],
+        gpus=docker_gpus,
+        shm_size=docker_shm_size,
+        network=docker_network,
+    )
 
     if detach:
+        if docker_target is not None:
+            raise typer.BadParameter("--docker is not supported with --detach yet")
         if tty:
             raise typer.BadParameter(
                 "--tty is meaningless with --detach (the session has its own pty)"
@@ -114,7 +183,14 @@ def run(
         return
 
     if result_json is not None:
-        completed = run_remote_tee(resolved, argv, script=shell, env=merged_env or None, cwd=cwd)
+        completed = run_remote_tee(
+            resolved,
+            argv,
+            script=shell,
+            env=merged_env or None,
+            cwd=cwd,
+            docker=docker_target,
+        )
         _write_result_json(result_json, completed, shell=shell, argv=argv)
         if completed.returncode != 0:
             raise RemoteError("remote command exited non-zero", exit_code=completed.returncode)
@@ -127,6 +203,7 @@ def run(
         tty=tty,
         env=merged_env or None,
         cwd=cwd,
+        docker=docker_target,
     )
     if code != 0:
         raise RemoteError("remote command exited non-zero", exit_code=code)
@@ -197,3 +274,96 @@ def _parse_env_file(path: Path) -> list[tuple[str, str]]:
             value = value[1:-1]
         pairs.append((key, value))
     return pairs
+
+
+def _resolve_docker_target(
+    profile_docker: DockerSpec | None,
+    *,
+    enabled: bool,
+    image: str | None,
+    container: str | None,
+    workdir: str | None,
+    mounts: list[str],
+    inherited_env: dict[str, str],
+    cli_env: dict[str, str],
+    docker_env_flags: list[str],
+    gpus: str | None,
+    shm_size: str | None,
+    network: str | None,
+) -> DockerSpec | None:
+    if image and container:
+        raise typer.BadParameter("--docker-image and --docker-container are mutually exclusive")
+
+    has_cli_override = any(
+        [
+            image,
+            container,
+            workdir,
+            mounts,
+            docker_env_flags,
+            gpus,
+            shm_size,
+            network,
+        ]
+    )
+    if not enabled and not has_cli_override:
+        return None
+
+    base = profile_docker or DockerSpec()
+    parsed_mounts = [_parse_docker_mount_flag(item) for item in mounts]
+    container_env = dict(inherited_env)
+    container_env.update(base.env)
+    container_env.update(cli_env)
+    for item in docker_env_flags:
+        key, value = _split_env(item)
+        container_env[key] = value
+
+    final_image = image if image is not None else base.image
+    final_container = container if container is not None else base.container
+    final_mounts = [*base.mounts, *parsed_mounts]
+    final_gpus = gpus if gpus is not None else base.gpus
+    final_shm_size = shm_size if shm_size is not None else base.shm_size
+    final_network = network if network is not None else base.network
+
+    if image is not None:
+        final_container = None
+    if container is not None:
+        final_image = None
+        if profile_docker is not None and profile_docker.image:
+            final_mounts = parsed_mounts
+            final_gpus = gpus
+            final_shm_size = shm_size
+            final_network = network
+
+    if final_image and final_container:
+        raise typer.BadParameter("docker image and container are mutually exclusive")
+    if final_image is None and final_container is None:
+        raise typer.BadParameter(
+            "--docker requires [docker].image/[docker].container, "
+            "--docker-image, or --docker-container"
+        )
+
+    return dataclasses.replace(
+        base,
+        image=final_image,
+        container=final_container,
+        workdir=workdir or base.workdir,
+        mounts=final_mounts,
+        env=container_env,
+        gpus=final_gpus,
+        shm_size=final_shm_size,
+        network=final_network,
+    )
+
+
+def _parse_docker_mount_flag(raw: str) -> DockerMount:
+    parts = raw.split(":")
+    if len(parts) not in {2, 3}:
+        raise typer.BadParameter(f"--docker-mount expects SRC:DST[:ro|rw], got {raw!r}")
+    source, target = parts[0], parts[1]
+    if not source or not target:
+        raise typer.BadParameter(f"--docker-mount expects non-empty SRC and DST, got {raw!r}")
+    mode = parts[2] if len(parts) == 3 else "rw"
+    if mode not in {"ro", "rw"}:
+        raise typer.BadParameter(f"--docker-mount mode must be 'ro' or 'rw', got {mode!r}")
+    return DockerMount(source=source, target=target, mode=mode)

@@ -19,6 +19,31 @@ class TunnelSpec:
 
 
 @dataclass(frozen=True)
+class DockerMount:
+    """A bind mount to apply when a profile runs commands through Docker."""
+
+    source: str
+    target: str
+    mode: str = "rw"
+
+
+@dataclass(frozen=True)
+class DockerSpec:
+    """Profile defaults for running a command in Docker on the remote host."""
+
+    image: str | None = None
+    container: str | None = None
+    workdir: str = "/workspace"
+    mounts: list[DockerMount] = field(default_factory=list)
+    env: dict[str, str] = field(default_factory=dict)
+    gpus: str | None = None
+    shm_size: str | None = None
+    network: str | None = None
+    args: list[str] = field(default_factory=list)
+    rm: bool = True
+
+
+@dataclass(frozen=True)
 class Profile:
     host: str
     remote_dir: str
@@ -37,6 +62,8 @@ class Profile:
     keep_remote: list[str] = field(default_factory=list)
     # Default port-forward for ``rcc tunnel`` (issue #2 P3).
     tunnel: TunnelSpec | None = None
+    # Optional Docker execution target for ``rcc run --docker``.
+    docker: DockerSpec | None = None
 
 
 @dataclass(frozen=True)
@@ -94,6 +121,7 @@ def _parse_profile(path: Path, name: str, body: dict[str, Any]) -> Profile:
     env = _parse_env(path, name, body.get("env"))
     keep_remote = _parse_keep_remote(path, name, body.get("keep_remote"))
     tunnel = _parse_tunnel(path, name, body.get("tunnel"))
+    docker = _parse_docker(path, name, body.get("docker"))
 
     return Profile(
         host=body["host"],
@@ -101,6 +129,7 @@ def _parse_profile(path: Path, name: str, body: dict[str, Any]) -> Profile:
         env=env,
         keep_remote=keep_remote,
         tunnel=tunnel,
+        docker=docker,
         **optional,
     )
 
@@ -152,6 +181,98 @@ def _parse_tunnel(path: Path, name: str, raw: Any) -> TunnelSpec | None:
         local_port=local_port,
         remote_host=remote_host if isinstance(remote_host, str) else "localhost",
     )
+
+
+def _parse_docker(path: Path, name: str, raw: Any) -> DockerSpec | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{path}: profile '{name}' field 'docker' must be a table")
+
+    image = _optional_string(path, name, raw, "docker.image")
+    container = _optional_string(path, name, raw, "docker.container")
+    if image and container:
+        raise ConfigError(
+            f"{path}: profile '{name}' docker.image and docker.container are mutually exclusive"
+        )
+
+    workdir = raw.get("workdir", "/workspace")
+    if not isinstance(workdir, str) or not workdir:
+        raise ConfigError(f"{path}: profile '{name}' docker.workdir must be a string")
+
+    args = raw.get("args", [])
+    if not isinstance(args, list) or not all(isinstance(item, str) for item in args):
+        raise ConfigError(f"{path}: profile '{name}' docker.args must be an array of strings")
+
+    rm = raw.get("rm", True)
+    if not isinstance(rm, bool):
+        raise ConfigError(f"{path}: profile '{name}' docker.rm must be a boolean")
+
+    return DockerSpec(
+        image=image,
+        container=container,
+        workdir=workdir,
+        mounts=_parse_docker_mounts(path, name, raw.get("mounts")),
+        env=_parse_docker_env(path, name, raw.get("env")),
+        gpus=_optional_string(path, name, raw, "docker.gpus"),
+        shm_size=_optional_string(path, name, raw, "docker.shm_size"),
+        network=_optional_string(path, name, raw, "docker.network"),
+        args=list(args),
+        rm=rm,
+    )
+
+
+def _optional_string(path: Path, name: str, raw: dict[str, Any], key: str) -> str | None:
+    field = key.split(".")[-1]
+    value = raw.get(field)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise ConfigError(f"{path}: profile '{name}' {key} must be a string")
+    return value
+
+
+def _parse_docker_mounts(path: Path, name: str, raw: Any) -> list[DockerMount]:
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ConfigError(f"{path}: profile '{name}' docker.mounts must be an array")
+    mounts: list[DockerMount] = []
+    for idx, item in enumerate(raw, start=1):
+        if not isinstance(item, dict):
+            raise ConfigError(f"{path}: profile '{name}' docker.mounts[{idx}] must be a table")
+        source = item.get("source")
+        target = item.get("target")
+        if not isinstance(source, str) or not source:
+            raise ConfigError(
+                f"{path}: profile '{name}' docker.mounts[{idx}].source must be a string"
+            )
+        if not isinstance(target, str) or not target:
+            raise ConfigError(
+                f"{path}: profile '{name}' docker.mounts[{idx}].target must be a string"
+            )
+        mode = item.get("mode", "rw")
+        if mode not in {"ro", "rw"}:
+            raise ConfigError(
+                f"{path}: profile '{name}' docker.mounts[{idx}].mode must be 'ro' or 'rw'"
+            )
+        mounts.append(DockerMount(source=source, target=target, mode=mode))
+    return mounts
+
+
+def _parse_docker_env(path: Path, name: str, raw: Any) -> dict[str, str]:
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{path}: profile '{name}' docker.env must be a table")
+    env: dict[str, str] = {}
+    for key, value in raw.items():
+        if not isinstance(key, str):
+            raise ConfigError(f"{path}: profile '{name}' docker.env entry {key!r} must be a string")
+        if isinstance(value, bool) or isinstance(value, (list, dict)):
+            raise ConfigError(f"{path}: profile '{name}' docker.env entry {key!r} must be a string")
+        env[key] = value if isinstance(value, str) else str(value)
+    return env
 
 
 def find_rcc_dir(start: Path) -> Path | None:
@@ -219,6 +340,22 @@ def get_field(profile: Profile, key: str) -> str:
             value = getattr(profile.tunnel, sub)
         except AttributeError as exc:
             raise ConfigError(f"tunnel has no field {sub!r}") from exc
+        return "" if value is None else str(value)
+    if key.startswith("docker."):
+        if profile.docker is None:
+            raise ConfigError("profile defines no docker")
+        sub = key[len("docker.") :]
+        if sub.startswith("env."):
+            env_key = sub[len("env.") :]
+            if env_key not in profile.docker.env:
+                raise ConfigError(f"docker.env has no key {env_key!r}")
+            return profile.docker.env[env_key]
+        try:
+            value = getattr(profile.docker, sub)
+        except AttributeError as exc:
+            raise ConfigError(f"docker has no field {sub!r}") from exc
+        if isinstance(value, (dict, list)):
+            raise ConfigError(f"docker.{sub} is structured; use --json")
         return "" if value is None else str(value)
     try:
         value = getattr(profile, key)

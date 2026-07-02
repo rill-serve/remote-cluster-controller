@@ -31,6 +31,22 @@ remote_dir = "/path/on/remote" # change me
 # remote_port = 8080
 # local_port = 18080        # optional; defaults to remote_port
 # remote_host = "localhost" # optional; set to a compute node to reach it
+
+# Optional Docker target for `rcc run --docker`:
+# [profiles.default.docker]
+# image = "pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime"
+# workdir = "/workspace"
+# gpus = "all"
+# shm_size = "16g"
+# network = "host"
+#
+# [[profiles.default.docker.mounts]]
+# source = "{remote_dir}"
+# target = "/workspace"
+# mode = "rw"
+#
+# [profiles.default.docker.env]
+# HF_HOME = "/workspace/.cache/huggingface"
 """
 
 _DEFAULT_IGNORE = """\

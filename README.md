@@ -25,6 +25,7 @@ rcc run -- nvidia-smi
 rcc run -t -- htop
 rcc run -s 'squeue -u $USER | head'   # shell snippet: pipelines, $vars survive
 rcc run --env EPOCHS=10 -- python train.py
+rcc run --docker -- python train.py   # run through the profile's remote Docker target
 rcc shell
 rcc pull jobs/results/                 # fetch just that subtree (bypasses rccignore)
 rcc status
@@ -57,6 +58,29 @@ TRITON_CACHE_DIR = "/scratch/cache"
 # remote_port = 8080
 # local_port = 18080        # optional; defaults to remote_port
 # remote_host = "localhost" # optional; set to a compute node to reach a service there
+
+# Optional Docker target for `rcc run --docker`.
+# Docker runs on the SSH remote host, so images and mount sources are resolved
+# there, not on your laptop.
+[profiles.myhost.docker]
+image = "pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime"
+workdir = "/workspace"
+gpus = "all"
+shm_size = "16g"
+network = "host"
+
+[[profiles.myhost.docker.mounts]]
+source = "{remote_dir}"
+target = "/workspace"
+mode = "rw"
+
+[[profiles.myhost.docker.mounts]]
+source = "/scratch/datasets"
+target = "/data"
+mode = "ro"
+
+[profiles.myhost.docker.env]
+HF_HOME = "/workspace/.cache/huggingface"
 ```
 
 Per-command overrides: `--profile`, `--host`, `--remote-dir`.
@@ -72,6 +96,9 @@ rcc config --get host                # single value, unquoted
 rcc config --get remote_dir
 rcc config --get env.TRITON_CACHE_DIR
 rcc config --get tunnel.remote_port
+rcc config --get docker.image
+rcc config --get docker.workdir
+rcc config --get docker.env.HF_HOME
 ```
 
 This lets wrappers drop fragile `sed`/regex parsing of free text.
@@ -159,6 +186,62 @@ rcc run -t -- htop                    # allocate a PTY
 
 `--env` layers on top of the profile's `[env]` defaults, removing the
 injection-fragile `KEY=VAL cmd` hand-quoting wrappers used to need.
+
+### Docker execution on the remote host
+
+`rcc run --docker` wraps the same remote command in `docker run` or
+`docker exec` on the SSH remote host. This keeps the daily command terse while
+the stable image, mounts, container workdir, GPU flags, and container env live in
+`.rcc/config.toml`.
+
+```bash
+rcc run --docker -- python train.py --epochs 10
+rcc run --docker -s 'python train.py 2>&1 | tee train.log'
+rcc run --docker-image my-debug-image -- bash
+rcc run --docker-container devbox --docker-workdir /workspace -- python -V
+```
+
+With the profile above, `rcc run --docker -- python train.py` executes roughly:
+
+```bash
+ssh myhost 'cd /abs/path/on/remote && docker run --rm \
+  --gpus all \
+  --shm-size 16g \
+  --network host \
+  --mount type=bind,src=/abs/path/on/remote,dst=/workspace \
+  --mount type=bind,src=/scratch/datasets,dst=/data,readonly \
+  --workdir /workspace \
+  --env TRITON_CACHE_DIR=/scratch/cache \
+  --env HF_HOME=/workspace/.cache/huggingface \
+  pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime \
+  python train.py'
+```
+
+Important semantics:
+
+- The Docker image is resolved by Docker on the remote machine. If the image
+  only exists locally, push it to a registry or load it on the remote first.
+- Docker mount sources are remote-host paths. `{remote_dir}` expands to the
+  resolved profile `remote_dir`; `{cwd}` expands to the effective remote working
+  directory.
+- Profile `[env]` values are still exported in the remote shell and are also
+  passed into the container. `[docker.env]` is container-only and wins over
+  profile env. CLI `--env` wins over profile env, and `--docker-env` wins last
+  inside the container.
+- `--docker-image` and `--docker-container` are mutually exclusive. Image mode
+  uses `docker run --rm`; container mode uses `docker exec`.
+- `--docker` is currently foreground-only; `--detach --docker` is rejected until
+  the tmux background runner grows container support.
+
+For one-off overrides:
+
+```bash
+rcc run --docker-image img \
+  --docker-workdir /app \
+  --docker-mount '{remote_dir}:/app:ro' \
+  --docker-gpus all \
+  -- pytest
+```
 
 ### Streaming + captured output together (tee)
 
@@ -307,8 +390,8 @@ instead of publishing the wrong version):
 ```bash
 # 1. bump version in pyproject.toml and src/rcc/__init__.py
 # 2. commit, then:
-git tag v0.3.1
-git push origin v0.3.1
+git tag v0.3.2
+git push origin v0.3.2
 ```
 
 Pushing the tag triggers the workflow. Watch it:

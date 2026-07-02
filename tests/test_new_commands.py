@@ -70,6 +70,134 @@ def test_run_bad_env_value(rcc_project: Path, monkeypatch):
     assert "KEY=VAL" in result.output
 
 
+# ------------------------------- run --docker ------------------------------- #
+
+
+def test_run_docker_profile_threads_target_and_env(tmp_path: Path, monkeypatch):
+    project = tmp_path / "p"
+    rcc = project / ".rcc"
+    rcc.mkdir(parents=True)
+    (rcc / "config.toml").write_text(
+        'default = "a"\n'
+        "[profiles.a]\n"
+        'host = "h"\n'
+        'remote_dir = "/r"\n'
+        "[profiles.a.env]\n"
+        'WANDB_PROJECT = "base"\n'
+        "[profiles.a.docker]\n"
+        'image = "img:cuda"\n'
+        'workdir = "/workspace"\n'
+        'gpus = "all"\n'
+        "[[profiles.a.docker.mounts]]\n"
+        'source = "{remote_dir}"\n'
+        'target = "/workspace"\n'
+        "[profiles.a.docker.env]\n"
+        'HF_HOME = "/workspace/.cache/hf"\n'
+    )
+    (rcc / "rccignore").write_text("")
+    monkeypatch.chdir(project)
+    with patch("rcc.commands.run.run_remote", return_value=0) as run_fn:
+        result = runner.invoke(
+            app,
+            [
+                "run",
+                "--docker",
+                "--env",
+                "CLI=1",
+                "--docker-env",
+                "HF_HOME=/tmp/hf",
+                "--",
+                "python",
+                "train.py",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert run_fn.call_args.kwargs["env"] == {"WANDB_PROJECT": "base", "CLI": "1"}
+        target = run_fn.call_args.kwargs["docker"]
+        assert target.image == "img:cuda"
+        assert target.workdir == "/workspace"
+        assert target.gpus == "all"
+        assert target.mounts[0].source == "{remote_dir}"
+        assert target.env == {
+            "WANDB_PROJECT": "base",
+            "HF_HOME": "/tmp/hf",
+            "CLI": "1",
+        }
+
+
+def test_run_docker_image_override_implies_docker(rcc_project: Path, monkeypatch):
+    monkeypatch.chdir(rcc_project)
+    with patch("rcc.commands.run.run_remote", return_value=0) as run_fn:
+        result = runner.invoke(
+            app,
+            [
+                "run",
+                "--docker-image",
+                "img",
+                "--docker-workdir",
+                "/app",
+                "--docker-mount",
+                "{remote_dir}:/app:ro",
+                "--docker-gpus",
+                "all",
+                "--docker-shm-size",
+                "8g",
+                "--docker-network",
+                "host",
+                "--",
+                "pytest",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        target = run_fn.call_args.kwargs["docker"]
+        assert target.image == "img"
+        assert target.workdir == "/app"
+        assert target.mounts[0].source == "{remote_dir}"
+        assert target.mounts[0].target == "/app"
+        assert target.mounts[0].mode == "ro"
+        assert target.gpus == "all"
+        assert target.shm_size == "8g"
+        assert target.network == "host"
+
+
+def test_run_docker_container_override(rcc_project: Path, monkeypatch):
+    monkeypatch.chdir(rcc_project)
+    with patch("rcc.commands.run.run_remote", return_value=0) as run_fn:
+        result = runner.invoke(
+            app,
+            ["run", "--docker-container", "devbox", "--docker-workdir", "/w", "--", "python", "-V"],
+        )
+        assert result.exit_code == 0, result.output
+        target = run_fn.call_args.kwargs["docker"]
+        assert target.container == "devbox"
+        assert target.image is None
+        assert target.workdir == "/w"
+
+
+def test_run_docker_requires_target(rcc_project: Path, monkeypatch):
+    monkeypatch.chdir(rcc_project)
+    result = runner.invoke(app, ["run", "--docker", "--", "true"])
+    assert result.exit_code != 0
+    assert "requires" in result.output
+
+
+def test_run_docker_rejects_image_and_container(rcc_project: Path, monkeypatch):
+    monkeypatch.chdir(rcc_project)
+    result = runner.invoke(
+        app,
+        ["run", "--docker-image", "img", "--docker-container", "devbox", "--", "true"],
+    )
+    assert result.exit_code != 0
+    assert "mutually exclusive" in result.output
+
+
+def test_run_docker_rejects_detach(rcc_project: Path, monkeypatch):
+    monkeypatch.chdir(rcc_project)
+    result = runner.invoke(app, ["run", "--docker-image", "img", "--detach", "--", "true"])
+    assert result.exit_code != 0
+    assert "detach" in result.output
+
+
 # ------------------------------- config ------------------------------------- #
 
 
@@ -89,6 +217,52 @@ def test_config_get_single_field(rcc_project: Path, monkeypatch):
     result = runner.invoke(app, ["config", "--get", "host"])
     assert result.exit_code == 0, result.output
     assert result.stdout.strip() == "alpha.example.com"
+
+
+def test_config_prints_docker_details(tmp_path: Path, monkeypatch):
+    project = tmp_path / "p"
+    rcc = project / ".rcc"
+    rcc.mkdir(parents=True)
+    (rcc / "config.toml").write_text(
+        'default = "a"\n'
+        "[profiles.a]\n"
+        'host = "h"\n'
+        'remote_dir = "/r"\n'
+        "[profiles.a.docker]\n"
+        'image = "img:cuda"\n'
+        'workdir = "/workspace"\n'
+        'gpus = "all"\n'
+        'shm_size = "16g"\n'
+        'network = "host"\n'
+        'args = ["--ipc=host"]\n'
+        "[[profiles.a.docker.mounts]]\n"
+        'source = "{remote_dir}"\n'
+        'target = "/workspace"\n'
+        'mode = "rw"\n'
+        "[profiles.a.docker.env]\n"
+        'HF_HOME = "/workspace/.cache/hf"\n'
+    )
+    (rcc / "rccignore").write_text("")
+    monkeypatch.chdir(project)
+    result = runner.invoke(app, ["config"])
+    assert result.exit_code == 0, result.output
+    assert "docker = {" in result.output
+    assert "image='img:cuda'" in result.output
+    assert "gpus='all'" in result.output
+    assert "shm_size='16g'" in result.output
+    assert "network='host'" in result.output
+    assert "args=['--ipc=host']" in result.output
+    assert "docker.mounts" in result.output
+    assert "source='{remote_dir}'" in result.output
+    assert "docker.env" in result.output
+    assert "HF_HOME" in result.output
+
+
+def test_run_help_mentions_remote_docker_semantics():
+    result = runner.invoke(app, ["run", "--help"])
+    assert result.exit_code == 0, result.output
+    assert "SSH remote host" in result.output
+    assert "remote-host path" in result.output
 
 
 # ------------------------------- push/pull flags ---------------------------- #
