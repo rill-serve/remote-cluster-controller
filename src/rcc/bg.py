@@ -126,7 +126,9 @@ def list_sessions_script() -> str:
     Suppressed stderr + ``|| true`` so a host with no sessions (or no server)
     yields empty output instead of an error.
     """
-    fmt = "#{session_name}\\t#{session_created_string}\\t#{session_attached}"
+    # tmux does not process backslash escapes in -F formats; the separator
+    # must be a REAL tab or parse_sessions garbles the columns.
+    fmt = "#{session_name}\t#{session_created_string}\t#{session_attached}"
     return f"tmux list-sessions -F {shlex.quote(fmt)} 2>/dev/null || true"
 
 
