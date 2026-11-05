@@ -121,10 +121,13 @@ def _argv_to_shell(argv: list[str]) -> str:
 
 
 def list_sessions_script() -> str:
-    """Shell snippet enumerating tmux sessions (name\\tcreated\\tattached).
+    """Shell snippet enumerating tmux sessions (name\tcreated\tattached).
 
     Suppressed stderr + ``|| true`` so a host with no sessions (or no server)
-    yields empty output instead of an error.
+    yields empty output instead of an error. The separator MUST be a real tab:
+    tmux does not process backslash escapes in ``-F`` formats, and
+    ``parse_sessions`` splits on ``\t`` — a literal ``\\t`` leaks into the
+    name field and garbles the columns.
     """
     # tmux does not process backslash escapes in -F formats; the separator
     # must be a REAL tab or parse_sessions garbles the columns.
@@ -215,6 +218,22 @@ def list_sessions(profile: Profile) -> list[SessionInfo]:
 
 def has_session(profile: Profile, name: str) -> bool:
     return run_remote_capture(profile, has_session_argv(name)).returncode == 0
+
+
+def exists(profile: Profile, name: str) -> bool:
+    """True if the run's tmux session OR its log artifact exists under ``profile``.
+
+    Finished runs keep only ``.rcc-runs/<name>.log`` (the tmux session is gone),
+    so the log check makes ``exists`` work for both live and finished runs —
+    what cross-profile name resolution needs.
+    """
+    s = sanitize(name)
+    artifacts = f"{profile.remote_dir.rstrip('/')}/{RUN_DIR}/{s}.log"
+    script = (
+        f"tmux has-session -t {shlex.quote(session(name))} 2>/dev/null "
+        f"|| test -e {shlex.quote(artifacts)}"
+    )
+    return run_remote_capture(profile, [], script=script).returncode == 0
 
 
 def read_status(profile: Profile, name: str) -> int | None:

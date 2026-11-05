@@ -89,6 +89,10 @@ def test_list_sessions_script_uses_format_and_suppresses_errors():
     assert "session_name" in s
     assert "2>/dev/null" in s
     assert "|| true" in s
+    # tmux does not expand backslash escapes in -F formats; the separators
+    # must be REAL tabs or parse_sessions garbles the columns.
+    assert "#{session_name}\t#{session_created_string}" in s
+    assert "\\t" not in s
 
 
 def test_parse_sessions_filters_prefix_and_fields():
@@ -105,6 +109,25 @@ def test_parse_sessions_filters_prefix_and_fields():
 def test_parse_sessions_empty():
     assert bg.parse_sessions("") == []
     assert bg.parse_sessions("no sessions\n") == []
+
+
+# ------------------------------- exists ------------------------------------- #
+
+
+def test_exists_builds_session_or_log_probe():
+    p = make_profile()
+    with patch("rcc.bg.run_remote_capture") as run:
+        run.return_value.returncode = 0
+        assert bg.exists(p, "run1") is True
+    script = run.call_args.kwargs["script"]
+    assert "tmux has-session -t rcc-run1" in script
+    assert "test -e /srv/app/.rcc-runs/run1.log" in script
+
+
+def test_exists_false_when_neither_session_nor_log():
+    with patch("rcc.bg.run_remote_capture") as run:
+        run.return_value.returncode = 1
+        assert bg.exists(make_profile(), "run1") is False
 
 
 # ------------------------------- misc argv ---------------------------------- #
