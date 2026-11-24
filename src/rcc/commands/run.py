@@ -8,9 +8,9 @@ from pathlib import Path
 import typer
 
 from rcc import bg, gpu
-from rcc.config import DockerMount, DockerSpec, find_rcc_dir, resolve_profile, validate_gpu_lock
+from rcc.config import DockerMount, DockerSpec, resolve_profile, validate_gpu_lock
 from rcc.context import merge_cli_overrides
-from rcc.errors import ConfigError, RemoteError
+from rcc.errors import RemoteError
 from rcc.ssh import run_remote, run_remote_tee
 
 
@@ -159,12 +159,9 @@ def run(
         )
     if shell is not None and argv:
         raise typer.BadParameter("-s/--shell cannot be combined with extra positional arguments")
-    rcc_dir = find_rcc_dir(Path.cwd())
-    if rcc_dir is None:
-        raise ConfigError("no .rcc/ found (run 'rcc init')")
     overrides = merge_cli_overrides(profile=profile, host=host, remote_dir=remote_dir)
     resolved = resolve_profile(
-        rcc_dir.parent,
+        Path.cwd(),
         profile_name=overrides.profile,
         host_override=overrides.host,
         remote_dir_override=overrides.remote_dir,

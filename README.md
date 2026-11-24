@@ -90,6 +90,38 @@ HF_HOME = "/workspace/.cache/huggingface"
 Per-command overrides: `--profile`, `--host`, `--remote-dir`.
 Excludes: edit `.rcc/rccignore` (gitignore syntax).
 
+### User-level profiles
+
+Put shared SSH settings in `~/.config/rcc/config.toml` (or
+`$XDG_CONFIG_HOME/rcc/config.toml` when `XDG_CONFIG_HOME` is an absolute path).
+For example:
+
+```toml
+default = "beverin"
+
+[profiles.beverin]
+host = "beverin"
+identity_file = "~/.ssh/id_ed25519"
+```
+
+In each project, set its own working directory in `.rcc/config.toml`:
+
+```toml
+[profiles.beverin]
+remote_dir = "/scratch/my-project"
+```
+
+The project file overrides individual keys, including keys inside tables such
+as `env`. Lists are replaced as a whole. CLI overrides take precedence over
+both files. Set `default` in either file, or use `--profile` to choose among
+multiple profiles.
+
+`rcc --profile beverin job list`, `job status`, and `job tail` also work
+outside a project. If `remote_dir` is omitted, they run from the remote login
+directory. Use `job tail --file /absolute/path/to/slurm.log` for logs stored
+elsewhere. Submitting jobs and running project commands requires a configured
+`remote_dir` or `--remote-dir`. File sync also requires a local `.rcc/`.
+
 ### SSH connections
 
 RCC reuses an active OpenSSH ControlMaster from your SSH configuration when the

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import os
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -71,23 +72,31 @@ class Profile:
 
 @dataclass(frozen=True)
 class Config:
-    default: str
+    default: str | None
     profiles: dict[str, Profile] = field(default_factory=dict)
 
 
-_REQUIRED = ("host", "remote_dir")
-
-
 def load_config(path: Path) -> Config:
+    return _parse_config(path, _read_config(path))
+
+
+def _read_config(path: Path, *, optional: bool = False) -> dict[str, Any]:
     try:
-        raw = tomllib.loads(path.read_text())
+        with path.open("rb") as stream:
+            return tomllib.load(stream)
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f"{path}: malformed TOML: {exc}") from exc
     except FileNotFoundError as exc:
+        if optional:
+            return {}
         raise ConfigError(f"{path}: not found") from exc
+    except (OSError, UnicodeError) as exc:
+        raise ConfigError(f"{path}: {exc}") from exc
 
+
+def _parse_config(path: Path, raw: dict[str, Any], *, layered: bool = False) -> Config:
     default = raw.get("default")
-    if not isinstance(default, str) or not default:
+    if (default is not None or not layered) and (not isinstance(default, str) or not default):
         raise ConfigError(f"{path}: missing 'default' profile name")
 
     profiles_raw = raw.get("profiles", {})
@@ -98,20 +107,26 @@ def load_config(path: Path) -> Config:
     for name, body in profiles_raw.items():
         if not isinstance(name, str) or not isinstance(body, dict):
             raise ConfigError(f"{path}: malformed profile entry")
-        profiles[name] = _parse_profile(path, name, body)
+        profiles[name] = _parse_profile(path, name, body, allow_missing_dir=layered)
 
-    if default not in profiles:
+    if default is None and len(profiles) == 1:
+        default = next(iter(profiles))
+    if default is not None and default not in profiles:
         raise ConfigError(f"{path}: default profile '{default}' not defined")
 
     return Config(default=default, profiles=profiles)
 
 
-def _parse_profile(path: Path, name: str, body: dict[str, Any]) -> Profile:
-    for required in _REQUIRED:
-        if required not in body:
-            raise ConfigError(f"{path}: profile '{name}' missing required field '{required}'")
-        if not isinstance(body[required], str) or not body[required]:
-            raise ConfigError(f"{path}: profile '{name}' field '{required}' must be a string")
+def _parse_profile(
+    path: Path, name: str, body: dict[str, Any], *, allow_missing_dir: bool
+) -> Profile:
+    for key in ("host", "remote_dir"):
+        if key == "remote_dir" and allow_missing_dir and key not in body:
+            continue
+        if key not in body:
+            raise ConfigError(f"{path}: profile '{name}' missing required field '{key}'")
+        if not isinstance(body[key], str) or not body[key]:
+            raise ConfigError(f"{path}: profile '{name}' field '{key}' must be a string")
 
     optional: dict[str, str] = {}
     for key in ("ssh_control_persist", "ssh_control_dir", "proxy_jump", "identity_file"):
@@ -139,7 +154,7 @@ def _parse_profile(path: Path, name: str, body: dict[str, Any]) -> Profile:
 
     return Profile(
         host=body["host"],
-        remote_dir=body["remote_dir"],
+        remote_dir=body.get("remote_dir", ""),
         env=env,
         keep_remote=keep_remote,
         tunnel=tunnel,
@@ -315,29 +330,58 @@ def find_rcc_dir(start: Path) -> Path | None:
         current = current.parent
 
 
+def _merge_tables(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
+    merged = base | overlay
+    for key, value in overlay.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            merged[key] = _merge_tables(base[key], value)
+    return merged
+
+
+def load_layered_config(start: Path) -> Config:
+    """Read user profiles and overlay the nearest project's configuration."""
+    xdg_value = os.environ.get("XDG_CONFIG_HOME")
+    xdg_home = Path(xdg_value) if xdg_value else None
+    user_path = (
+        (xdg_home if xdg_home is not None and xdg_home.is_absolute() else Path.home() / ".config")
+        / "rcc"
+        / "config.toml"
+    )
+    user = _read_config(user_path, optional=True)
+    rcc_dir = find_rcc_dir(start)
+    if rcc_dir is None:
+        if not user:
+            raise ConfigError(f"no .rcc/ found and no user config at {user_path} (run 'rcc init')")
+        return _parse_config(user_path, user, layered=True)
+    project_path = rcc_dir / "config.toml"
+    project = _read_config(project_path, optional=bool(user))
+    return _parse_config(project_path, _merge_tables(user, project), layered=True)
+
+
 def resolve_profile(
     start: Path,
     *,
     profile_name: str | None = None,
     host_override: str | None = None,
     remote_dir_override: str | None = None,
+    require_remote_dir: bool = True,
 ) -> Profile:
-    rcc_dir = find_rcc_dir(start)
-    if rcc_dir is None:
-        raise ConfigError("no .rcc/ found (run 'rcc init')")
-
-    cfg = load_config(rcc_dir / "config.toml")
+    cfg = load_layered_config(start)
     name = profile_name or cfg.default
+    if name is None:
+        raise ConfigError("no default profile configured; select a profile with --profile")
     if name not in cfg.profiles:
-        raise ConfigError(f"profile '{name}' not defined in {rcc_dir}/config.toml")
+        raise ConfigError(f"profile '{name}' not defined in the user or project config")
 
     profile = cfg.profiles[name]
-    overrides: dict[str, str] = {}
-    if host_override:
-        overrides["host"] = host_override
-    if remote_dir_override:
-        overrides["remote_dir"] = remote_dir_override
-    return dataclasses.replace(profile, **overrides) if overrides else profile
+    remote_dir = remote_dir_override or profile.remote_dir
+    if require_remote_dir and not remote_dir:
+        raise ConfigError(
+            f"profile '{name}' needs a remote_dir; set it in .rcc/config.toml or pass --remote-dir"
+        )
+    return dataclasses.replace(
+        profile, host=host_override or profile.host, remote_dir=remote_dir or "."
+    )
 
 
 def profile_to_dict(profile: Profile) -> dict[str, Any]:

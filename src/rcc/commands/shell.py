@@ -4,9 +4,9 @@ from pathlib import Path
 
 import typer
 
-from rcc.config import find_rcc_dir, resolve_profile
+from rcc.config import resolve_profile
 from rcc.context import merge_cli_overrides
-from rcc.errors import ConfigError, RemoteError
+from rcc.errors import RemoteError
 from rcc.ssh import run_remote
 
 
@@ -16,12 +16,9 @@ def shell(
     remote_dir: str | None = typer.Option(None, "--remote-dir"),
 ) -> None:
     """Open an interactive remote shell in remote_dir."""
-    rcc_dir = find_rcc_dir(Path.cwd())
-    if rcc_dir is None:
-        raise ConfigError("no .rcc/ found (run 'rcc init')")
     overrides = merge_cli_overrides(profile=profile, host=host, remote_dir=remote_dir)
     resolved = resolve_profile(
-        rcc_dir.parent,
+        Path.cwd(),
         profile_name=overrides.profile,
         host_override=overrides.host,
         remote_dir_override=overrides.remote_dir,

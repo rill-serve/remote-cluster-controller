@@ -5,9 +5,8 @@ from pathlib import Path
 
 import typer
 
-from rcc.config import find_rcc_dir, get_field, profile_to_dict, resolve_profile
+from rcc.config import get_field, profile_to_dict, resolve_profile
 from rcc.context import merge_cli_overrides
-from rcc.errors import ConfigError
 
 
 def config(
@@ -32,15 +31,13 @@ def config(
     object; ``--get KEY`` prints a single value (no quoting), so wrappers can
     stop parsing free text (issue #2 P2 / issue #3 #5).
     """
-    rcc_dir = find_rcc_dir(Path.cwd())
-    if rcc_dir is None:
-        raise ConfigError("no .rcc/ found (run 'rcc init')")
     overrides = merge_cli_overrides(profile=profile, host=host, remote_dir=remote_dir)
     resolved = resolve_profile(
-        rcc_dir.parent,
+        Path.cwd(),
         profile_name=overrides.profile,
         host_override=overrides.host,
         remote_dir_override=overrides.remote_dir,
+        require_remote_dir=False,
     )
     if get is not None:
         typer.echo(get_field(resolved, get))

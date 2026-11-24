@@ -1,31 +1,25 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import typer
 
 from rcc import bg
-from rcc.config import Profile, find_rcc_dir, load_config, resolve_profile
+from rcc.config import Profile, load_layered_config, resolve_profile
 from rcc.context import merge_cli_overrides
-from rcc.errors import ConfigError, RemoteError
+from rcc.errors import RemoteError
 
 
-def _rcc_dir() -> Path:
-    rcc_dir = find_rcc_dir(Path.cwd())
-    if rcc_dir is None:
-        raise ConfigError("no .rcc/ found (run 'rcc init')")
-    return rcc_dir
-
-
-def _other_profiles(rcc_dir: Path, resolved: Profile):
+def _other_profiles(start: Path, resolved: Profile):
     """Configured profiles pointing at a DIFFERENT host/dir than ``resolved``."""
-    config = load_config(rcc_dir / "config.toml")
+    config = load_layered_config(start)
     for pname, p in config.profiles.items():
-        if (p.host, p.remote_dir) != (resolved.host, resolved.remote_dir):
+        if p.remote_dir and (p.host, p.remote_dir) != (resolved.host, resolved.remote_dir):
             yield pname, p
 
 
-def _cross_profile_lookup(rcc_dir: Path, resolved: Profile, name: str) -> Profile:
+def _cross_profile_lookup(start: Path, resolved: Profile, name: str) -> Profile:
     """bg runs live per-host: an explicit session name shouldn't require
     remembering which ``--profile`` launched it. If the run does not exist
     under the resolved profile, probe the others (cheap ssh checks; hosts may
@@ -33,7 +27,7 @@ def _cross_profile_lookup(rcc_dir: Path, resolved: Profile, name: str) -> Profil
     """
     if bg.exists(resolved, name):
         return resolved
-    for pname, p in _other_profiles(rcc_dir, resolved):
+    for pname, p in _other_profiles(start, resolved):
         try:
             if bg.exists(p, name):
                 typer.echo(f"resolving {name!r} on profile {pname!r} ({p.host})", err=True)
@@ -43,7 +37,7 @@ def _cross_profile_lookup(rcc_dir: Path, resolved: Profile, name: str) -> Profil
     return resolved  # not found anywhere: let the command's own error speak
 
 
-def _resolve_target(rcc_dir: Path, resolved: Profile, name: str | None) -> tuple[Profile, str]:
+def _resolve_target(start: Path, resolved: Profile, name: str | None) -> tuple[Profile, str]:
     """Resolve (profile, session name) for a bg command.
 
     With an explicit name: search other profiles when the resolved one doesn't
@@ -53,12 +47,12 @@ def _resolve_target(rcc_dir: Path, resolved: Profile, name: str | None) -> tuple
     ``rcc bg logs`` is the canonical trap).
     """
     if name is not None:
-        return _cross_profile_lookup(rcc_dir, resolved, name), name
+        return _cross_profile_lookup(start, resolved, name), name
     try:
         return resolved, bg.resolve_name(resolved, name)
     except RemoteError:
         found: list[tuple[str, Profile, str]] = []
-        for pname, p in _other_profiles(rcc_dir, resolved):
+        for pname, p in _other_profiles(start, resolved):
             try:
                 for s in bg.list_sessions(p):
                     found.append((pname, p, s.name))
@@ -74,16 +68,20 @@ def _resolve_target(rcc_dir: Path, resolved: Profile, name: str | None) -> tuple
         raise
 
 
-def _resolve(profile: str | None, host: str | None, remote_dir: str | None) -> Profile:
-    rcc_dir = find_rcc_dir(Path.cwd())
-    if rcc_dir is None:
-        raise ConfigError("no .rcc/ found (run 'rcc init')")
+def _resolve(
+    profile: str | None,
+    host: str | None,
+    remote_dir: str | None,
+    *,
+    require_remote_dir: bool = True,
+) -> Profile:
     overrides = merge_cli_overrides(profile=profile, host=host, remote_dir=remote_dir)
     return resolve_profile(
-        rcc_dir.parent,
+        Path.cwd(),
         profile_name=overrides.profile,
         host_override=overrides.host,
         remote_dir_override=overrides.remote_dir,
+        require_remote_dir=require_remote_dir,
     )
 
 
@@ -93,14 +91,16 @@ def ps(
     remote_dir: str | None = typer.Option(None, "--remote-dir"),
 ) -> None:
     """List running rcc detached sessions (tmux)."""
-    rcc_dir = _rcc_dir()
-    resolved = _resolve(profile, host, remote_dir)
+    overrides = merge_cli_overrides(profile=profile, host=host, remote_dir=remote_dir)
     # Without overrides, aggregate every configured profile so sessions on
     # non-default hosts (e.g. sgs while default=beverin) are visible.
-    if profile is None and host is None and remote_dir is None:
-        targets = {name: p for name, p in load_config(rcc_dir / "config.toml").profiles.items()}
+    if not (overrides.profile or overrides.host or overrides.remote_dir):
+        targets = {
+            name: replace(p, remote_dir=p.remote_dir or ".")
+            for name, p in load_layered_config(Path.cwd()).profiles.items()
+        }
     else:
-        targets = {"(resolved)": resolved}
+        targets = {"(resolved)": _resolve(profile, host, remote_dir, require_remote_dir=False)}
     rows = []
     for pname, p in targets.items():
         try:
@@ -123,9 +123,8 @@ def logs(
     remote_dir: str | None = typer.Option(None, "--remote-dir"),
 ) -> None:
     """Tail the log of a detached run (in remote_dir/.rcc-runs/<name>.log)."""
-    rcc_dir = _rcc_dir()
     resolved = _resolve(profile, host, remote_dir)
-    resolved, target = _resolve_target(rcc_dir, resolved, name)
+    resolved, target = _resolve_target(Path.cwd(), resolved, name)
     code = bg.logs(resolved, target, follow=follow)
     if code != 0:
         raise RemoteError("tail exited non-zero", exit_code=code)
@@ -138,9 +137,8 @@ def attach(
     remote_dir: str | None = typer.Option(None, "--remote-dir"),
 ) -> None:
     """Attach to a running detached session (tmux attach)."""
-    rcc_dir = _rcc_dir()
     resolved = _resolve(profile, host, remote_dir)
-    resolved, target = _resolve_target(rcc_dir, resolved, name)
+    resolved, target = _resolve_target(Path.cwd(), resolved, name)
     code = bg.attach(resolved, target)
     if code != 0:
         raise RemoteError("tmux attach exited non-zero", exit_code=code)
@@ -161,8 +159,7 @@ def wait(
     launch→monitor loop for non-SLURM hosts in one command (issue #3 #2).
     """
     resolved = _resolve(profile, host, remote_dir)
-    rcc_dir = _rcc_dir()
-    resolved, target = _resolve_target(rcc_dir, resolved, name)
+    resolved, target = _resolve_target(Path.cwd(), resolved, name)
     code = bg.wait(resolved, target, timeout=timeout)
     if code is None:
         typer.echo(f"timed out waiting for {target!r}", err=True)
@@ -178,9 +175,8 @@ def stop(
     remote_dir: str | None = typer.Option(None, "--remote-dir"),
 ) -> None:
     """Kill a detached run (tmux kill-session)."""
-    rcc_dir = _rcc_dir()
     resolved = _resolve(profile, host, remote_dir)
-    resolved, target = _resolve_target(rcc_dir, resolved, name)
+    resolved, target = _resolve_target(Path.cwd(), resolved, name)
     code = bg.stop(resolved, target)
     if code != 0:
         raise RemoteError("tmux kill-session exited non-zero", exit_code=code)

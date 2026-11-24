@@ -90,6 +90,44 @@ def test_resolve_profile_cli_overrides(rcc_project: Path):
     assert profile.remote_dir == "/x"
 
 
+def test_resolve_profile_layers_project_keys_over_user_config(
+    rcc_project: Path, isolated_user_config: Path
+):
+    isolated_user_config.parent.mkdir(parents=True)
+    isolated_user_config.write_text(
+        'default = "beta"\n'
+        '[profiles.beta]\nhost = "other"\n'
+        '[profiles.alpha]\nhost = "shared"\nproxy_jump = "gateway"\n'
+        'keep_remote = ["keep/"]\n'
+        '[profiles.alpha.env]\nCOMMON = "shared"\nMODE = "default"\n'
+    )
+    (rcc_project / ".rcc" / "config.toml").write_text(
+        'default = "alpha"\n'
+        '[profiles.alpha]\nremote_dir = "/project"\nkeep_remote = []\n'
+        '[profiles.alpha.env]\nMODE = "project"\n'
+    )
+    profile = resolve_profile(rcc_project)
+    assert profile.host == "shared"
+    assert profile.proxy_jump == "gateway"
+    assert profile.remote_dir == "/project"
+    assert profile.keep_remote == []
+    assert profile.env == {"COMMON": "shared", "MODE": "project"}
+    beta = resolve_profile(rcc_project, profile_name="beta", remote_dir_override="/explicit")
+    assert (beta.host, beta.remote_dir) == ("other", "/explicit")
+
+
+def test_resolve_profile_uses_home_config_without_xdg(tmp_path: Path, monkeypatch):
+    monkeypatch.delenv("XDG_CONFIG_HOME")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    user_config = tmp_path / ".config" / "rcc" / "config.toml"
+    user_config.parent.mkdir(parents=True)
+    user_config.write_text('[profiles.alpha]\nhost = "a"\n')
+    profile = resolve_profile(tmp_path, require_remote_dir=False)
+    assert (profile.host, profile.remote_dir) == ("a", ".")
+    with pytest.raises(ConfigError, match="needs a remote_dir"):
+        resolve_profile(tmp_path)
+
+
 def test_resolve_profile_raises_when_no_rcc_dir(tmp_path: Path):
     with pytest.raises(ConfigError, match="no .rcc/"):
         resolve_profile(tmp_path)

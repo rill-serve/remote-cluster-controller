@@ -165,6 +165,36 @@ def test_cli_job_no_rcc_dir_exits_2(tmp_path: Path):
     assert "no .rcc/" in result.stderr
 
 
+def test_cli_jobs_accept_user_profiles_outside_projects(
+    tmp_path: Path, isolated_user_config: Path, monkeypatch
+):
+    isolated_user_config.parent.mkdir(parents=True)
+    isolated_user_config.write_text(
+        '[profiles.alpha]\nhost = "a"\n[profiles.beta]\nhost = "b"\n'
+    )
+    monkeypatch.chdir(tmp_path)
+    with (
+        patch("rcc.slurm.list_jobs_json", return_value=[]) as list_fn,
+        patch("rcc.slurm.status", return_value=0) as status_fn,
+        patch("rcc.slurm.tail", return_value=0) as tail_fn,
+        patch("rcc.slurm.submit") as submit_fn,
+    ):
+        for args in (
+            ["list", "--json"],
+            ["status", "42"],
+            ["tail", "42", "--file", "/scratch/output.log"],
+        ):
+            result = runner.invoke(app, ["--profile", "beta", "job", *args])
+            assert result.exit_code == 0, result.output
+        for command in (list_fn, status_fn, tail_fn):
+            resolved = command.call_args.args[0]
+            assert (resolved.host, resolved.remote_dir) == ("b", ".")
+        result = runner.invoke(app, ["--profile", "beta", "job", "submit", "job.sh"])
+        assert result.exit_code == 2
+        assert "needs a remote_dir" in result.output
+        submit_fn.assert_not_called()
+
+
 def test_cli_status_no_ssh_exits_1(rcc_project: Path, monkeypatch):
     monkeypatch.chdir(rcc_project)
     with patch("rcc.commands.status.shutil.which", return_value=None):

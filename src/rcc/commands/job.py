@@ -6,21 +6,25 @@ from pathlib import Path
 import typer
 
 from rcc import slurm
-from rcc.config import Profile, find_rcc_dir, resolve_profile
+from rcc.config import Profile, resolve_profile
 from rcc.context import merge_cli_overrides
-from rcc.errors import ConfigError, RemoteError
+from rcc.errors import RemoteError
 
 
-def _resolve(profile: str | None, host: str | None, remote_dir: str | None) -> Profile:
-    rcc_dir = find_rcc_dir(Path.cwd())
-    if rcc_dir is None:
-        raise ConfigError("no .rcc/ found (run 'rcc init')")
+def _resolve(
+    profile: str | None,
+    host: str | None,
+    remote_dir: str | None,
+    *,
+    require_remote_dir: bool = False,
+) -> Profile:
     overrides = merge_cli_overrides(profile=profile, host=host, remote_dir=remote_dir)
     return resolve_profile(
-        rcc_dir.parent,
+        Path.cwd(),
         profile_name=overrides.profile,
         host_override=overrides.host,
         remote_dir_override=overrides.remote_dir,
+        require_remote_dir=require_remote_dir,
     )
 
 
@@ -52,7 +56,7 @@ def submit(
 ) -> None:
     """Submit a Slurm batch script (sbatch) and print the allocated JOBID."""
     env = [_split_env(item) for item in (extra_env or [])]
-    resolved = _resolve(profile, host, remote_dir)
+    resolved = _resolve(profile, host, remote_dir, require_remote_dir=True)
     code = slurm.submit(resolved, script, env, wait=wait, dependency=dependency)
     if code != 0:
         raise RemoteError("sbatch exited non-zero", exit_code=code)
@@ -62,7 +66,9 @@ def list_jobs(
     json_output: bool = typer.Option(
         False, "--json", help="Emit a JSON array of {JobID, Name, Partition, State, ...}."
     ),
-    start: bool = typer.Option(False, "--start", help="Include Slurm's pending job start estimates."),
+    start: bool = typer.Option(
+        False, "--start", help="Include Slurm's pending job start estimates."
+    ),
     profile: str | None = typer.Option(None, "--profile"),
     host: str | None = typer.Option(None, "--host"),
     remote_dir: str | None = typer.Option(None, "--remote-dir"),

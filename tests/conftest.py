@@ -5,6 +5,13 @@ from pathlib import Path
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def isolated_user_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    config_home = tmp_path / "user-config"
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(config_home))
+    return config_home / "rcc" / "config.toml"
+
+
 @pytest.fixture
 def rcc_project(tmp_path: Path) -> Path:
     """A tmp project with a minimal .rcc/config.toml and rccignore."""

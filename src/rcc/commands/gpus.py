@@ -29,6 +29,7 @@ def gpus(
         profile_name=overrides.profile,
         host_override=overrides.host,
         remote_dir_override=overrides.remote_dir,
+        require_remote_dir=False,
     )
     lock = gpu_lock if gpu_lock is not None else resolved.gpu_lock or gpu.DEFAULT_LOCK
     try:
