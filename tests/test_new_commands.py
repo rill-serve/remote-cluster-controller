@@ -328,7 +328,10 @@ def test_tunnel_builds_forward_argv_from_profile(tmp_path: Path, monkeypatch):
         captured["argv"] = argv
         raise KeyboardInterrupt
 
-    with patch("rcc.commands.tunnel.subprocess.run", side_effect=fake_run):
+    with (
+        patch("rcc.ssh._user_mux_options", return_value=None),
+        patch("rcc.commands.tunnel.subprocess.run", side_effect=fake_run),
+    ):
         result = runner.invoke(app, ["tunnel"])
     assert result.exit_code == 0, result.output
     assert "9000:head:8000" in captured["argv"]
@@ -348,7 +351,10 @@ def test_tunnel_explicit_flags_override_profile(tmp_path: Path, monkeypatch):
         captured["argv"] = argv
         raise KeyboardInterrupt
 
-    with patch("rcc.commands.tunnel.subprocess.run", side_effect=fake_run):
+    with (
+        patch("rcc.ssh._user_mux_options", return_value=None),
+        patch("rcc.commands.tunnel.subprocess.run", side_effect=fake_run),
+    ):
         result = runner.invoke(app, ["tunnel", "--remote-port", "80", "--local-port", "8080"])
     assert result.exit_code == 0, result.output
     assert "8080:localhost:80" in captured["argv"]

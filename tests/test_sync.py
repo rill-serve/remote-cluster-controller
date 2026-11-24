@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from rcc._paramiko_fallback import plan_pull_transfers, plan_push_transfers
-from rcc._rsync import DryRunSummary, build_rsync_argv, run_rsync
+from rcc._rsync import DryRunSummary, build_rsync_argv, run_rsync, run_rsync_dry_run
 from rcc.config import Profile
 from rcc.errors import RemoteError
 from rcc.sync import _local_prune, pull, push
@@ -35,7 +35,7 @@ def test_build_rsync_argv_push_defaults(tmp_path: Path):
     assert "-a" in argv and "-z" in argv
     assert "--partial" in argv
     assert "--human-readable" in argv
-    assert "--info=stats2,progress2" in argv
+    assert "--info=stats2" in argv
     assert f"--exclude-from={ignore}" in argv
     assert "-e" in argv
     assert "ssh -o X=y" in argv
@@ -62,11 +62,14 @@ def test_build_rsync_argv_dry_run_and_delete_and_extra(tmp_path: Path):
     assert "--exclude=tmp/" in argv
 
 
-def test_run_rsync_raises_on_nonzero():
+@pytest.mark.parametrize("transfer", [run_rsync, run_rsync_dry_run])
+def test_run_rsync_reports_error_diagnostics(transfer):
     with patch("rcc._rsync.subprocess.run") as mocked:
-        mocked.return_value = subprocess.CompletedProcess(args=[], returncode=23)
-        with pytest.raises(RemoteError) as exc_info:
-            run_rsync(["rsync", "-a"])
+        mocked.return_value = subprocess.CompletedProcess(
+            args=[], returncode=23, stderr="rsync: remote source directory is missing\n"
+        )
+        with pytest.raises(RemoteError, match="remote source directory is missing") as exc_info:
+            transfer(["rsync", "-a"])
         assert exc_info.value.exit_code == 23
 
 

@@ -19,6 +19,10 @@ remote_dir = "/path/on/remote" # change me
 # proxy_jump = "bastion.example.com"
 # identity_file = "~/.ssh/id_ed25519"
 
+# Shared GPU coordination on the remote host:
+# gpu_lock = "/tmp/rcc-gpu{N}.lock"
+# deny_gpus = [2]
+
 # Per-profile env defaults honored by `rcc run` (issue #2 P1):
 # [profiles.default.env]
 # TRITON_CACHE_DIR = "/scratch/cache"

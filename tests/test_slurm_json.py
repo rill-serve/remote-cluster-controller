@@ -11,20 +11,31 @@ from __future__ import annotations
 import subprocess
 from unittest.mock import patch
 
+import pytest
+
 from rcc import slurm
 from rcc.config import Profile
+from rcc.errors import RemoteError
 
 PROFILE = Profile(host="h", remote_dir="/r")
+TABLE_FIELDS = ["JobID", "Name", "Partition", "State", "Time", "NodeList"]
 
 
 # ------------------------------- builders ----------------------------------- #
 
 
-def test_squeue_json_script_uses_pipe_format_no_header():
-    s = slurm.squeue_json_script()
+def test_squeue_script_uses_explicit_format_no_header():
+    s = slurm.squeue_script()
     assert "squeue -h " in s
-    assert "%i|%j|%P|%T|%M|%N" in s  # our explicit pipe-delimited %-codes
+    assert "\x1f".join("%i %j %P %T %M %N %r %l %S %E %a %V %D".split()) in s
     assert "id -un" in s  # current-user expansion
+    assert "--start" not in s
+
+
+def test_squeue_start_script_uses_job_id_and_start_time():
+    s = slurm.squeue_script(start=True)
+    assert "--start --states=PENDING " in s
+    assert "%i\x1f%S" in s
 
 
 def test_sacct_json_argv_uses_parsable_and_format():
@@ -40,7 +51,7 @@ def test_sacct_json_argv_uses_parsable_and_format():
 
 def test_parse_rows_fixed_fields_squeue():
     out = "12345|train|gpu|RUNNING|5:00|node[01-02]\n12346|eval|cpu|PENDING|0:00|\n"
-    rows = slurm.parse_rows(out, slurm.SQUEUE_JSON_FIELDS)
+    rows = slurm.parse_rows(out, TABLE_FIELDS)
     assert len(rows) == 2
     assert rows[0]["JobID"] == "12345"
     assert rows[0]["State"] == "RUNNING"
@@ -64,7 +75,7 @@ def test_parse_rows_header_driven_sacct():
 
 
 def test_parse_rows_empty_input():
-    assert slurm.parse_rows("", slurm.SQUEUE_JSON_FIELDS) == []
+    assert slurm.parse_rows("", TABLE_FIELDS) == []
     assert slurm.parse_rows("") == []
 
 
@@ -79,7 +90,7 @@ def test_parse_rows_header_only_no_data():
 
 def test_parse_rows_skips_blank_lines_and_strips():
     out = "\n  12345 | train | gpu | RUNNING \n\n"
-    rows = slurm.parse_rows(out, slurm.SQUEUE_JSON_FIELDS)
+    rows = slurm.parse_rows(out, TABLE_FIELDS)
     assert rows == [
         {
             "JobID": "12345",
@@ -94,16 +105,16 @@ def test_parse_rows_skips_blank_lines_and_strips():
 
 def test_parse_rows_ragged_row_is_padded():
     # A row missing trailing fields must not misalign (padded to header length).
-    rows = slurm.parse_rows("1|a\n", slurm.SQUEUE_JSON_FIELDS)
+    rows = slurm.parse_rows("1|a\n", TABLE_FIELDS)
     assert rows[0]["JobID"] == "1"
     assert rows[0]["Name"] == "a"
     assert rows[0]["NodeList"] == ""
-    assert len(rows[0]) == len(slurm.SQUEUE_JSON_FIELDS)
+    assert len(rows[0]) == len(TABLE_FIELDS)
 
 
 def test_parse_rows_handles_nodeless_placeholder():
     # squeue emits the literal text "None" when there is no node assigned yet.
-    rows = slurm.parse_rows("1|a|gpu|PENDING|0:00|None\n", slurm.SQUEUE_JSON_FIELDS)
+    rows = slurm.parse_rows("1|a|gpu|PENDING|0:00|None\n", TABLE_FIELDS)
     assert rows[0]["NodeList"] == "None"  # preserved verbatim, not coerced
 
 
@@ -139,6 +150,29 @@ def test_enrich_no_exitcode_field():
     assert row["ok"] is False
 
 
+@pytest.mark.parametrize(
+    ("state", "expected"),
+    [
+        ("COMPLETED", True),
+        ("FAILED", False),
+        ("CANCELLED", False),
+        ("TIMEOUT", False),
+        ("OUT_OF_MEMORY", False),
+        ("NODE_FAIL", False),
+        ("PREEMPTED", False),
+        ("BOOT_FAIL", False),
+        ("DEADLINE", False),
+        ("RUNNING", None),
+        ("PENDING", None),
+        ("COMPLETING", None),
+        ("REQUEUED", None),
+        ("UNKNOWN", None),
+    ],
+)
+def test_queue_ok_reports_only_terminal_outcomes(state, expected):
+    assert slurm._queue_ok(state) is expected
+
+
 def test_enrich_garbage_exitcode_yields_none():
     row = slurm._enrich({"State": "FAILED", "ExitCode": "weird"})
     assert row["exit_code"] is None
@@ -153,20 +187,74 @@ def test_enrich_no_state_field():
 # ------------------------------- SSH-backed ops ----------------------------- #
 
 
-def _cap(stdout: str, returncode: int = 0) -> subprocess.CompletedProcess:
-    return subprocess.CompletedProcess([], returncode, stdout, "")
+def _cap(stdout: str, returncode: int = 0, stderr: str = "") -> subprocess.CompletedProcess:
+    return subprocess.CompletedProcess([], returncode, stdout, stderr)
+
+
+def _squeue_output(*rows: str) -> str:
+    return "\n".join(row.replace("|", "\x1f") for row in rows)
 
 
 def test_list_jobs_json_parses_squeue_output():
-    squeue_out = "12345|train|gpu|RUNNING|5:00|node01\n12346|eval|cpu|PENDING|0:00|None\n"
+    squeue_out = _squeue_output(
+        "12345|train|gpu|RUNNING|5:00|node01|None|1:30|2026-07-03T17:00:00||a|2026-07-03T16:00:00|1",
+        "12346|eval|cpu|PENDING|0:00|None|Dependency|1:30|N/A|afterok:12345|a|2026-07-03T16:00:00|2",
+    )
     with (
         patch("rcc.slurm.run_remote_capture", return_value=_cap(squeue_out)),
         patch("rcc.slurm.ensure_slurm"),
     ):
         rows = slurm.list_jobs_json(PROFILE)
     assert [r["JobID"] for r in rows] == ["12345", "12346"]
-    assert rows[0]["ok"] is False  # RUNNING is not COMPLETED
+    assert rows[0]["ok"] is None
     assert "exit_code" not in rows[0]  # squeue output has no ExitCode field
+    assert rows[1] == {
+        "JobID": "12346",
+        "Name": "eval",
+        "Partition": "cpu",
+        "State": "PENDING",
+        "Time": "0:00",
+        "NodeList": "None",
+        "Reason": "Dependency",
+        "TimeLimit": "1:30",
+        "StartTime": None,
+        "Dependency": "afterok:12345",
+        "Account": "a",
+        "SubmitTime": "2026-07-03T16:00:00",
+        "NumNodes": "2",
+        "ok": None,
+    }
+
+
+def test_list_jobs_json_merges_estimates_without_removing_active_jobs():
+    queue = _squeue_output(
+        "100|train|gpu|RUNNING|5:00|node01|None|1:30|17:00||a|16:00|1",
+        "101_4|eval|cpu|PENDING|0:00||Priority|1:30|Unknown||a|16:00|1",
+        "102|eval|cpu|PENDING|0:00||Priority|1:30|17:30||a|16:00|1",
+        "103|eval|cpu|PENDING|0:00||Priority|1:30|None||a|16:00|1",
+    )
+    estimates = _squeue_output("104|20:00", "102|N/A", "101_4|18:00")
+    with (
+        patch("rcc.slurm.run_remote_capture", side_effect=[_cap(queue), _cap(estimates)]) as cap,
+        patch("rcc.slurm.ensure_slurm"),
+    ):
+        rows = slurm.list_jobs_json(PROFILE, start=True)
+    assert [(row["JobID"], row["StartTime"]) for row in rows] == [
+        ("100", "17:00"), ("101_4", "18:00"), ("102", None), ("103", None),
+    ]
+    assert "--start" in cap.call_args.kwargs["script"]
+
+
+def test_list_jobs_json_surfaces_squeue_failure(capsys):
+    result = _cap("", 1, "squeue: error: Communication connection failure\n")
+    with (
+        patch("rcc.slurm.run_remote_capture", return_value=result),
+        patch("rcc.slurm.ensure_slurm"),
+        pytest.raises(RemoteError, match="squeue exited non-zero") as error,
+    ):
+        slurm.list_jobs_json(PROFILE)
+    assert error.value.exit_code == 1
+    assert "Communication connection failure" in capsys.readouterr().err
 
 
 def test_list_jobs_json_empty_when_no_jobs():

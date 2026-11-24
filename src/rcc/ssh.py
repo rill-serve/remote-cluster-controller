@@ -17,15 +17,8 @@ Mode = Literal["run", "mux_check", "mux_exit"]
 log = logging.getLogger(__name__)
 
 
-def _shared_mux_options(profile: Profile) -> list[str]:
-    opts: list[str] = [
-        "-o",
-        f"ControlPersist={profile.ssh_control_persist}",
-        "-o",
-        f"ControlPath={profile.ssh_control_dir}/%C",
-        "-o",
-        "ControlMaster=auto",
-    ]
+def _connection_options(profile: Profile) -> list[str]:
+    opts: list[str] = []
     # Bastion hops: encapsulated per-profile instead of a hand-maintained
     # SSH-config dance (issue #2 P3).
     if profile.proxy_jump:
@@ -36,8 +29,55 @@ def _shared_mux_options(profile: Profile) -> list[str]:
     return opts
 
 
+def _managed_mux_options(profile: Profile) -> list[str]:
+    return [
+        "-o",
+        f"ControlPersist={profile.ssh_control_persist}",
+        "-o",
+        f"ControlPath={profile.ssh_control_dir}/%C",
+        "-o",
+        "ControlMaster=auto",
+    ]
+
+
+def _user_mux_options(profile: Profile, connection: list[str]) -> list[str] | None:
+    # Let OpenSSH expand ControlPath tokens and evaluate Host/Match using the
+    # same host alias and connection overrides as the actual command.
+    options = ["-o", "ControlMaster=no", "-o", "ControlPersist=no", *connection]
+    try:
+        config = subprocess.run(
+            ["ssh", "-G", *options, profile.host],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if config.returncode != 0:
+            return None
+        for line in (config.stdout or "").splitlines():
+            key, _, value = line.partition(" ")
+            if key == "controlpath" and value and value != "none" and Path(value).is_socket():
+                check = subprocess.run(
+                    ["ssh", *options, "-O", "check", profile.host],
+                    capture_output=True,
+                    timeout=5,
+                )
+                return options if check.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return None
+
+
+def _shared_mux_options(profile: Profile, *, reuse_user: bool = True) -> list[str]:
+    connection = _connection_options(profile)
+    if reuse_user:
+        user_options = _user_mux_options(profile, connection)
+        if user_options is not None:
+            return user_options
+    return [*_managed_mux_options(profile), *connection]
+
+
 def build_ssh_args(profile: Profile, *, mode: Mode, tty: bool = False) -> list[str]:
-    argv: list[str] = ["ssh", *_shared_mux_options(profile)]
+    argv: list[str] = ["ssh", *_shared_mux_options(profile, reuse_user=mode == "run")]
     if mode == "run":
         if tty:
             argv.append("-t")
@@ -439,9 +479,11 @@ def ensure_remote_path(profile: Profile, remote_path: str) -> None:
     _paramiko_ensure_remote_dir(profile, path=remote_path)
 
 
-def mux_check(profile: Profile) -> bool:
+def mux_check(profile: Profile, *, include_user: bool = False) -> bool:
     if not _primary_available():
         return False
+    if include_user and _user_mux_options(profile, _connection_options(profile)) is not None:
+        return True
     _ensure_control_dir(profile)
     result = subprocess.run(
         build_ssh_args(profile, mode="mux_check"),
@@ -449,6 +491,15 @@ def mux_check(profile: Profile) -> bool:
         stderr=subprocess.DEVNULL,
     )
     return result.returncode == 0
+
+
+def check_ssh_connection(profile: Profile, result: subprocess.CompletedProcess[str]) -> None:
+    stderr = (result.stderr or "").strip()
+    if result.returncode == 255 or (result.returncode != 0 and "Permission denied (" in stderr):
+        message = f"SSH authentication or connection failed for {profile.host}"
+        if stderr:
+            message = f"{message}: {stderr}"
+        raise RemoteError(message, exit_code=result.returncode)
 
 
 def mux_exit(profile: Profile) -> None:

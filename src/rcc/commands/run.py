@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import math
 from pathlib import Path
 
 import typer
 
-from rcc import bg
-from rcc.config import DockerMount, DockerSpec, find_rcc_dir, resolve_profile
+from rcc import bg, gpu
+from rcc.config import DockerMount, DockerSpec, find_rcc_dir, resolve_profile, validate_gpu_lock
 from rcc.context import merge_cli_overrides
 from rcc.errors import ConfigError, RemoteError
 from rcc.ssh import run_remote, run_remote_tee
@@ -99,6 +100,30 @@ def run(
         "--docker-gpus",
         help="Pass --gpus to docker run, e.g. all.",
     ),
+    gpus: str | None = typer.Option(
+        None, "--gpus", metavar="INDEX[,INDEX...]", help="Select and lock host GPUs by index."
+    ),
+    wait_idle_gpus: bool = typer.Option(
+        False, "--wait-idle-gpus", help="Wait until the selected GPUs are idle and unlocked."
+    ),
+    idle_checks: int = typer.Option(
+        gpu.DEFAULT_IDLE_CHECKS, "--idle-checks", min=1, help="Consecutive idle checks required."
+    ),
+    idle_interval: float = typer.Option(
+        gpu.DEFAULT_IDLE_INTERVAL, "--idle-interval", min=0.01, help="Seconds between idle checks."
+    ),
+    idle_memory_mib: int = typer.Option(
+        gpu.DEFAULT_IDLE_MEMORY_MIB,
+        "--idle-memory-mib",
+        min=0,
+        help="Maximum memory in use per GPU for an idle check.",
+    ),
+    gpu_lock: str | None = typer.Option(
+        None,
+        "--gpu-lock",
+        metavar="PATH",
+        help="Shared remote lock filename with a {N} placeholder.",
+    ),
     docker_shm_size: str | None = typer.Option(
         None,
         "--docker-shm-size",
@@ -162,17 +187,64 @@ def run(
         network=docker_network,
     )
 
-    if detach:
+    if detach and tty:
+        raise typer.BadParameter("--tty is meaningless with --detach (the session has its own pty)")
+    session_name = (name or _auto_name(shell, argv)) if detach else None
+    if gpus is not None:
+        if docker_gpus is not None:
+            raise typer.BadParameter("--gpus and --docker-gpus are mutually exclusive")
+        try:
+            indices = gpu.parse_indices(gpus)
+            lock = gpu_lock if gpu_lock is not None else resolved.gpu_lock or gpu.DEFAULT_LOCK
+            validate_gpu_lock(lock)
+            gpu_session = bg.sanitize(session_name) if session_name is not None else None
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+        if wait_idle_gpus and not math.isfinite(idle_interval):
+            raise typer.BadParameter("--idle-interval must be finite")
+        denied = sorted(set(indices).intersection(resolved.deny_gpus))
+        if denied:
+            raise typer.BadParameter(f"profile denies GPU indices: {', '.join(map(str, denied))}")
         if docker_target is not None:
+            if docker_target.container:
+                raise typer.BadParameter("--gpus requires a Docker image when using Docker")
+            _validate_managed_docker_args(docker_target.args)
+            docker_target = dataclasses.replace(docker_target, gpus=gpu.docker_devices(indices))
+        remote_argv = gpu.run_argv(
+            resolved,
+            argv,
+            script=shell,
+            work_dir=bg.resolve_cwd(resolved.remote_dir, cwd)
+            if detach
+            else cwd or resolved.remote_dir,
+            docker=docker_target,
+            tty=tty and result_json is None,
+            session=gpu_session,
+            indices=indices,
+            lock=lock,
+            idle_checks=idle_checks if wait_idle_gpus else 0,
+            idle_interval=idle_interval,
+            idle_memory_mib=idle_memory_mib,
+        )
+        remote_script, docker_target = None, None
+    else:
+        if wait_idle_gpus or gpu_lock is not None:
+            raise typer.BadParameter("--wait-idle-gpus and --gpu-lock require --gpus")
+        if resolved.deny_gpus and (detach or docker_target is not None):
+            raise typer.BadParameter("this profile reserves GPU indices; select GPUs with --gpus")
+        if detach and docker_target is not None:
             raise typer.BadParameter("--docker is not supported with --detach yet")
-        if tty:
-            raise typer.BadParameter(
-                "--tty is meaningless with --detach (the session has its own pty)"
-            )
-        session_name = name or _auto_name(shell, argv)
+        remote_argv, remote_script = argv, shell
+
+    if session_name is not None:
         try:
             final = bg.start(
-                resolved, session_name, argv, script=shell, env=merged_env or None, cwd=cwd
+                resolved,
+                session_name,
+                remote_argv,
+                script=remote_script,
+                env=merged_env or None,
+                cwd=cwd,
             )
         except ValueError as exc:  # bad name
             raise typer.BadParameter(str(exc)) from exc
@@ -185,8 +257,8 @@ def run(
     if result_json is not None:
         completed = run_remote_tee(
             resolved,
-            argv,
-            script=shell,
+            remote_argv,
+            script=remote_script,
             env=merged_env or None,
             cwd=cwd,
             docker=docker_target,
@@ -198,8 +270,8 @@ def run(
 
     code = run_remote(
         resolved,
-        argv,
-        script=shell,
+        remote_argv,
+        script=remote_script,
         tty=tty,
         env=merged_env or None,
         cwd=cwd,
@@ -207,6 +279,21 @@ def run(
     )
     if code != 0:
         raise RemoteError("remote command exited non-zero", exit_code=code)
+
+
+def _validate_managed_docker_args(args: list[str]) -> None:
+    reserved = {
+        "-d",
+        "--detach",
+        "--gpus",
+        "--device",
+        "--device-cgroup-rule",
+        "--privileged",
+        "--restart",
+    }
+    for arg in args:
+        if arg.split("=", 1)[0] in reserved:
+            raise typer.BadParameter(f"docker.args cannot set {arg!r} on GPU-managed runs")
 
 
 def _auto_name(shell: str | None, argv: list[str]) -> str:

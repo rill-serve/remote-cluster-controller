@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from subprocess import CompletedProcess
 from unittest.mock import patch
 
 import pytest
@@ -157,12 +158,19 @@ def test_ensure_tmux_ok():
 
 
 def test_ensure_tmux_raises_when_missing():
-    with patch("rcc.bg.run_remote_capture") as cap:
-        cap.return_value.returncode = 1
+    with patch("rcc.bg.run_remote_capture", return_value=CompletedProcess([], 1, "", "")):
         with pytest.raises(RemoteError) as ei:
             bg.ensure_tmux(make_profile(host="node"))
         assert ei.value.exit_code == 127
         assert "tmux" in str(ei.value)
+
+
+def test_ensure_tmux_surfaces_ssh_failure():
+    result = CompletedProcess([], 255, "", "Permission denied (publickey).")
+    with patch("rcc.bg.run_remote_capture", return_value=result):
+        with pytest.raises(RemoteError, match="Permission denied") as error:
+            bg.ensure_tmux(make_profile(host="node"))
+    assert error.value.exit_code == 255
 
 
 def test_start_returns_sanitized_name():

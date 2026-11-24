@@ -34,7 +34,7 @@ def status(
         host_override=overrides.host,
         remote_dir_override=overrides.remote_dir,
     )
-    open_ = mux_check(resolved)
+    open_ = mux_check(resolved, include_user=True)
     if json_output:
         typer.echo(json.dumps({"controlmaster_open": open_, "host": resolved.host}))
         return

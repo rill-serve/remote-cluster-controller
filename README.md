@@ -46,12 +46,16 @@ remote_dir = "/abs/path/on/remote"
 # proxy_jump = "bastion.example.com"
 # identity_file = "~/.ssh/id_ed25519"
 
+# Remote-owned paths to protect from --delete/--mirror (rccignore-with-teeth):
+# keep_remote = ["logs/", "cache/", "*.safetensors", "last_service.env"]
+
+# Optional coordination settings for a shared GPU host.
+# gpu_lock = "/tmp/rcc-gpu{N}.lock"
+# deny_gpus = [2]
+
 # Per-profile env defaults, honored by `rcc run` and `rcc job submit`:
 [profiles.myhost.env]
 TRITON_CACHE_DIR = "/scratch/cache"
-
-# Remote-owned paths to protect from --delete/--mirror (rccignore-with-teeth):
-# keep_remote = ["logs/", "cache/", "*.safetensors", "last_service.env"]
 
 # Default port-forward for `rcc tunnel`:
 # [profiles.myhost.tunnel]
@@ -85,6 +89,15 @@ HF_HOME = "/workspace/.cache/huggingface"
 
 Per-command overrides: `--profile`, `--host`, `--remote-dir`.
 Excludes: edit `.rcc/rccignore` (gitignore syntax).
+
+### SSH connections
+
+RCC reuses an active OpenSSH ControlMaster from your SSH configuration when the
+profile's host or alias resolves to its socket. On a host that requires 2FA,
+open the configured master with `ssh <alias>` and use that alias as the
+profile's `host`. RCC uses its own control socket when the configured master
+is unavailable. `rcc status` checks both sockets, and `rcc close` closes the
+RCC-managed master.
 
 ### Machine-readable config
 
@@ -230,8 +243,7 @@ Important semantics:
   inside the container.
 - `--docker-image` and `--docker-container` are mutually exclusive. Image mode
   uses `docker run --rm`; container mode uses `docker exec`.
-- `--docker` is currently foreground-only; `--detach --docker` is rejected until
-  the tmux background runner grows container support.
+- `--detach --docker` accepts image targets with explicit `--gpus` indices.
 
 For one-off overrides:
 
@@ -279,6 +291,35 @@ exit `127` with a hint if missing). The `--name` is optional (auto-generated);
 `logs`/`attach`/`wait`/`stop` default to the sole running session if you omit it.
 This removes the hand-rolled tmux orchestration every non-SLURM consumer needed.
 
+### Shared GPU hosts
+
+```bash
+rcc run --docker --gpus 0,1 --wait-idle-gpus -- python train.py
+rcc run --detach --name sweep --gpus 0,1 --wait-idle-gpus \
+  --idle-checks 3 --idle-interval 120 --idle-memory-mib 256 -- python train.py
+rcc gpus
+rcc gpus --json
+```
+
+`--gpus` selects host GPU indices from `nvidia-smi` and locks each selected
+GPU for the run. `--wait-idle-gpus` polls until all selected GPUs are unlocked,
+have no compute processes, and are at or below the memory threshold for the
+configured number of consecutive checks. The defaults are three checks,
+120 seconds between checks, and 256 MiB per GPU. A run using `--gpus` alone
+fails if a selected GPU is already locked.
+
+Users coordinating on the same host need a common lock path. The default is
+`/tmp/rcc-gpu{N}.lock`, where `{N}` is the GPU index. Set `gpu_lock` in the
+profile or pass `--gpu-lock` to both `run` and `gpus` for a custom path.
+`rcc gpus` reports device usage and active claims, including owner, session,
+image, and start time when available. Locks coordinate launches that use the
+same lock path. The idle checks also detect compute processes from other
+launchers.
+
+GPU coordination requires `python3` and `nvidia-smi` on the remote host.
+Managed Docker runs create an image-based container for the selected GPUs.
+The profile's `deny_gpus` list reserves indices from GPU-managed runs.
+
 ## Port-forwarding: tunnel
 
 ```bash
@@ -287,10 +328,8 @@ rcc tunnel --remote-port 8080         # ...or specify explicitly
 rcc tunnel --remote-port 8080 --remote-host head01 --local-port 18080
 ```
 
-`rcc tunnel` opens a local port-forward reusing rcc's SSH ControlMaster (the
-same connection `status`/`close` manage), collapsing the manual
-`ssh -L 8080:head:8080 host` tail every workflow used to end with. Ctrl-C closes
-it.
+`rcc tunnel` opens a local port-forward using the SSH ControlMaster for the
+profile. Ctrl-C closes the tunnel.
 
 ## Slurm jobs (`rcc job`)
 
@@ -303,6 +342,8 @@ rcc job submit train.sh --extra-env EPOCHS=10   # sbatch, prints the JOBID
 rcc job submit train.sh -W --dependency afterok:524614   # block until done + chain after a prior job
 rcc job list                                     # squeue for your user
 rcc job list --json                              # ...as structured records for wrappers
+rcc job list --start --json                      # include pending-job start estimates
+rcc job update 524615 --dependency afterok:524614  # update an existing job's dependency
 rcc job status 524614                            # sacct -j <id> (fixed format)
 rcc job status 524614 --json                     # ...as structured records (main + steps)
 rcc job tail 524614 -f                           # tail -f slurm-524614.out
@@ -313,17 +354,18 @@ rcc job cancel 524614                            # scancel
 
 Notes:
 
-- The `submit`/`list`/`status`/`cancel` verbs sniff for `sbatch` on the remote
-  and exit `127` with a hint on non-Slurm hosts; `tail` skips the check (`tail`
-  is universal).
-- `list` and `status` use a fixed, readable `--format=`; you never type one.
-  Their `--json` variants return pipe-delimited output parsed into structured
-  records (issue #2 P2). `list --json` emits one record per active job;
-  `status --json` emits one record per row sacct returns (the main job plus
-  each step — distinguished by the `JobID` field, e.g. `524614.batch`). Each
-  row with a `State` gains an `ok` flag, and each row with an `ExitCode`
-  `RETURN:SIGNAL` gains parsed integer `exit_code`/`signal` fields, so an
-  OOM-killed step shows up as `"exit_code": 137, "signal": 9`.
+- Slurm commands check for `sbatch` and exit `127` when it is missing. SSH
+  connection failures show the SSH diagnostic. `job tail` reads the log
+  directly.
+- The `job list` table and JSON output contain the same jobs. JSON includes
+  `Reason`, `TimeLimit`, `StartTime`, `Dependency`, `Account`, `SubmitTime`,
+  and `NumNodes`. `--start` adds start estimates for pending jobs and shows
+  `StartTime` in the table. Unavailable start times are `null` in JSON.
+- In `job list --json`, `ok` is `true` for completed jobs, `false` for
+  terminal failures, and `null` for jobs still in progress. `job status --json`
+  includes each accounting row, including job steps such as `524614.batch`.
+  Accounting rows include integer `exit_code` and `signal` fields when Slurm
+  reports a return code and signal.
 - `job submit -W/--wait` blocks until the job finishes and `rcc` exits with the
   job's exit code — closing the submit→monitor loop in one command. `--dependency`
   passes `--dependency=<TYPE:JOBID>` straight to sbatch for chaining (e.g.

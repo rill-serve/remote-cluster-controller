@@ -11,6 +11,7 @@ import typer
 from rcc import __version__
 from rcc.commands import close as close_cmd
 from rcc.commands import config_cmd
+from rcc.commands import gpus as gpus_cmd
 from rcc.commands import init as init_cmd
 from rcc.commands import job as job_cmd
 from rcc.commands import pull as pull_cmd
@@ -93,6 +94,7 @@ app.command(name="status")(_wrap(status_cmd.status))
 app.command(name="close")(_wrap(close_cmd.close))
 app.command(name="config")(_wrap(config_cmd.config))
 app.command(name="tunnel")(_wrap(tunnel_cmd.tunnel))
+app.command(name="gpus")(_wrap(gpus_cmd.gpus))
 
 bg_app = typer.Typer(
     help="Detached (background) runs for non-SLURM hosts, backed by tmux: "
@@ -114,6 +116,7 @@ job_app = typer.Typer(
 )
 job_app.command(name="submit")(_wrap(job_cmd.submit))
 job_app.command(name="list")(_wrap(job_cmd.list_jobs))
+job_app.command(name="update")(_wrap(job_cmd.update))
 job_app.command(name="status")(_wrap(job_cmd.status))
 job_app.command(name="tail")(_wrap(job_cmd.tail))
 job_app.command(name="cancel")(_wrap(job_cmd.cancel))
