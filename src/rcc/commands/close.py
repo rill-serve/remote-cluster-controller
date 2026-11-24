@@ -16,7 +16,7 @@ def close(
     host: str | None = typer.Option(None, "--host"),
     remote_dir: str | None = typer.Option(None, "--remote-dir"),
 ) -> None:
-    """Close the SSH ControlMaster connection for the profile's host."""
+    """Close the RCC-managed SSH ControlMaster for the profile's host."""
     if shutil.which("ssh") is None:
         typer.echo("ControlMaster not available without system ssh.", err=True)
         raise typer.Exit(code=1)
@@ -34,4 +34,4 @@ def close(
         mux_exit(resolved)
         typer.echo(f"Closed ControlMaster for {resolved.host}.")
     else:
-        typer.echo(f"ControlMaster was not open for {resolved.host}.")
+        typer.echo(f"No RCC-managed ControlMaster is open for {resolved.host}.")

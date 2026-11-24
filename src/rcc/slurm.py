@@ -8,6 +8,7 @@ pipeline: rcc composes the remote command and streams the result back.
 
 from __future__ import annotations
 
+import csv
 import re
 import shlex
 import sys
@@ -16,19 +17,31 @@ from dataclasses import dataclass
 
 from rcc.config import Profile
 from rcc.errors import RemoteError
-from rcc.ssh import run_remote, run_remote_capture
+from rcc.ssh import check_ssh_connection, run_remote, run_remote_capture
 
-# Fixed, readable output formats. Plain field names (no width specifiers) so
-# they are valid across Slurm versions; squeue/sacct auto-size the columns.
-SQUEUE_FORMAT = "JobID,Name,Partition,State,Time,NodeList"
 SACCT_FORMAT = "JobID,JobName,Partition,State,Elapsed,ExitCode,Reason,Start,End"
 
-# Pipe-delimited formats for ``--json``. For squeue we emit explicit ``%`` codes
-# joined by ``|`` under ``-h`` (no header): we control both the delimiter and
-# the field order, so parsing never depends on ``--parsable`` being available.
-# The field-name list below MUST stay paired with the %-code order.
-SQUEUE_JSON_FORMAT = "%i|%j|%P|%T|%M|%N"
-SQUEUE_JSON_FIELDS = ["JobID", "Name", "Partition", "State", "Time", "NodeList"]
+_SQUEUE_TABLE_COLUMNS = {
+    "JobID": "%i",
+    "Name": "%j",
+    "Partition": "%P",
+    "State": "%T",
+    "Time": "%M",
+    "NodeList": "%N",
+}
+_SQUEUE_COLUMNS = {
+    **_SQUEUE_TABLE_COLUMNS,
+    "Reason": "%r",
+    "TimeLimit": "%l",
+    "StartTime": "%S",
+    "Dependency": "%E",
+    "Account": "%a",
+    "SubmitTime": "%V",
+    "NumNodes": "%D",
+}
+_SQUEUE_START_COLUMNS = {"JobID": "%i", "StartTime": "%S"}
+# Job names may contain pipes, commas, and spaces.
+_SQUEUE_SEPARATOR = "\x1f"
 
 # Slurm's default stdout/stderr file is slurm-%j.out, written in the job's
 # submit directory (== remote_dir under rcc). %j -> JOBID.
@@ -71,13 +84,12 @@ def sacct_argv(job_id: str) -> list[str]:
     return ["sacct", "-j", job_id, f"--format={SACCT_FORMAT}"]
 
 
-def squeue_script() -> str:
-    """Shell snippet for ``job list``.
-
-    Runs under a shell (needs command substitution for the current user) and
-    pins a fixed ``--format`` so the user never has to quote one.
-    """
-    return f'squeue -u "$(id -un)" --format={shlex.quote(SQUEUE_FORMAT)}'
+def squeue_script(*, start: bool = False) -> str:
+    """Query the remote user's jobs with an explicit headerless Slurm format."""
+    columns = _SQUEUE_START_COLUMNS if start else _SQUEUE_COLUMNS
+    format_arg = shlex.quote(_SQUEUE_SEPARATOR.join(columns.values()))
+    start_args = " --start --states=PENDING" if start else ""
+    return f'squeue -h -u "$(id -un)"{start_args} --format={format_arg}'
 
 
 def tail_argv(job_id: str, *, follow: bool, filename: str | None) -> list[str]:
@@ -90,12 +102,18 @@ def tail_argv(job_id: str, *, follow: bool, filename: str | None) -> list[str]:
 def ensure_slurm(profile: Profile) -> None:
     """Raise RemoteError (exit 127) if sbatch is not on the remote PATH."""
     result = run_remote_capture(profile, ["command", "-v", "sbatch"])
-    if result.returncode != 0:
+    if result.returncode == 0:
+        return
+    check_ssh_connection(profile, result)
+    stderr = (result.stderr or "").strip()
+    if result.returncode == 1 and not stderr:
         raise RemoteError(
             f"Slurm does not appear to be installed on {profile.host} "
             f"(sbatch not found). Is this an HPC login node?",
             exit_code=127,
         )
+    detail = f": {stderr}" if stderr else ""
+    raise RemoteError(f"could not check Slurm on {profile.host}{detail}", exit_code=result.returncode)
 
 
 def submit(
@@ -127,9 +145,15 @@ def submit(
     return 0
 
 
-def list_jobs(profile: Profile) -> int:
-    ensure_slurm(profile)
-    return run_remote(profile, [], script=squeue_script())
+def list_jobs(profile: Profile, *, start: bool = False) -> int:
+    rows = list_jobs_json(profile, start=start)
+    columns = list(_SQUEUE_TABLE_COLUMNS)
+    if start:
+        columns.append("StartTime")
+    writer = csv.writer(sys.stdout, lineterminator="\n")
+    writer.writerow(columns)
+    writer.writerows([row[column] for column in columns] for row in rows)
+    return 0
 
 
 def status(profile: Profile, job_id: str) -> int:
@@ -146,6 +170,11 @@ def tail(profile: Profile, job_id: str, *, follow: bool, filename: str | None) -
 def cancel(profile: Profile, job_id: str) -> int:
     ensure_slurm(profile)
     return run_remote(profile, cancel_argv(job_id))
+
+
+def update(profile: Profile, job_id: str, dependency: str) -> int:
+    ensure_slurm(profile)
+    return run_remote(profile, ["scontrol", "update", f"JobId={job_id}", f"Dependency={dependency}"])
 
 
 # --------------------------------------------------------------------------- #
@@ -244,18 +273,19 @@ def wait(
 
 
 # --------------------------------------------------------------------------- #
-# Structured (JSON) job listing/status (issue #2 P2)
+# Structured job listing/status
 # --------------------------------------------------------------------------- #
 
-
-def squeue_json_script() -> str:
-    """squeue as pipe-delimited rows with a known, rcc-defined field order.
-
-    ``-h`` drops the header; the ``|``s inside ``--format`` are our delimiter,
-    and :data:`SQUEUE_JSON_FIELDS` is the paired column list. We don't rely on
-    ``--parsable`` (its availability/meaning varies across squeue versions).
-    """
-    return f'squeue -h -u "$(id -un)" --format={shlex.quote(SQUEUE_JSON_FORMAT)}'
+_FAILED_STATES = {
+    "BOOT_FAIL",
+    "CANCELLED",
+    "DEADLINE",
+    "FAILED",
+    "NODE_FAIL",
+    "OUT_OF_MEMORY",
+    "PREEMPTED",
+    "TIMEOUT",
+}
 
 
 def sacct_json_argv(job_id: str) -> list[str]:
@@ -267,8 +297,10 @@ def sacct_json_argv(job_id: str) -> list[str]:
     return ["sacct", "-j", job_id, "--parsable", f"--format={SACCT_FORMAT}"]
 
 
-def parse_rows(output: str, fields: list[str] | None = None) -> list[dict[str, str]]:
-    """Parse pipe-delimited Slurm output into a list of ``{field: value}`` dicts.
+def parse_rows(
+    output: str, fields: list[str] | None = None, *, separator: str = "|"
+) -> list[dict[str, str]]:
+    """Parse delimited Slurm output into a list of ``{field: value}`` dicts.
 
     Pure / testable. If ``fields`` is given, every non-empty line is a data row
     in that fixed column order (use with ``-h``/``--noheader`` output, e.g.
@@ -280,7 +312,7 @@ def parse_rows(output: str, fields: list[str] | None = None) -> list[dict[str, s
     if not lines:
         return []
     if fields is None:
-        header = [c.strip() for c in lines[0].split("|")]
+        header = [c.strip() for c in lines[0].split(separator)]
         lines = lines[1:]
         if not lines:
             return []
@@ -288,7 +320,7 @@ def parse_rows(output: str, fields: list[str] | None = None) -> list[dict[str, s
         header = fields
     rows: list[dict[str, str]] = []
     for line in lines:
-        values = [c.strip() for c in line.split("|")]
+        values = [c.strip() for c in line.split(separator)]
         if len(values) < len(header):
             values += [""] * (len(header) - len(values))
         rows.append(dict(zip(header, values)))
@@ -323,11 +355,51 @@ def _enrich(row: dict[str, str]) -> dict[str, object]:
     return out
 
 
-def list_jobs_json(profile: Profile) -> list[dict[str, object]]:
+def _squeue_rows(profile: Profile, *, start: bool = False) -> list[dict[str, str]]:
+    result = run_remote_capture(profile, [], script=squeue_script(start=start))
+    check_ssh_connection(profile, result)
+    if result.stderr:
+        sys.stderr.write(result.stderr)
+    if result.returncode:
+        command = "squeue --start" if start else "squeue"
+        raise RemoteError(f"{command} exited non-zero", exit_code=result.returncode)
+    columns = _SQUEUE_START_COLUMNS if start else _SQUEUE_COLUMNS
+    # Multi-cluster Slurm output may include standalone cluster headings.
+    data = "\n".join(
+        line
+        for line in result.stdout.splitlines()
+        if line.count(_SQUEUE_SEPARATOR) == len(columns) - 1
+    )
+    return parse_rows(data, list(columns), separator=_SQUEUE_SEPARATOR)
+
+
+def _queue_ok(state: str) -> bool | None:
+    if state in _OK_STATES:
+        return True
+    if state in _FAILED_STATES:
+        return False
+    return None
+
+
+def list_jobs_json(profile: Profile, *, start: bool = False) -> list[dict[str, object]]:
     """Return the current user's queued/running jobs as structured records."""
     ensure_slurm(profile)
-    result = run_remote_capture(profile, [], script=squeue_json_script())
-    return [_enrich(r) for r in parse_rows(result.stdout, SQUEUE_JSON_FIELDS)]
+    rows = _squeue_rows(profile)
+    estimates = {}
+    if start:
+        estimates = {row["JobID"]: row["StartTime"] for row in _squeue_rows(profile, start=True)}
+    jobs = []
+    for row in rows:
+        start_time = row["StartTime"]
+        if row["State"] == "PENDING":
+            start_time = estimates.get(row["JobID"], start_time)
+        job: dict[str, object] = dict(row)
+        job["ok"] = _queue_ok(row["State"])
+        job["StartTime"] = (
+            None if start_time.casefold() in {"", "n/a", "none", "unknown"} else start_time
+        )
+        jobs.append(job)
+    return jobs
 
 
 def status_json(profile: Profile, job_id: str) -> list[dict[str, object]]:

@@ -64,6 +64,9 @@ class Profile:
     tunnel: TunnelSpec | None = None
     # Optional Docker execution target for ``rcc run --docker``.
     docker: DockerSpec | None = None
+    # Shared lock path template and GPU indices reserved on this host.
+    gpu_lock: str | None = None
+    deny_gpus: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -122,6 +125,17 @@ def _parse_profile(path: Path, name: str, body: dict[str, Any]) -> Profile:
     keep_remote = _parse_keep_remote(path, name, body.get("keep_remote"))
     tunnel = _parse_tunnel(path, name, body.get("tunnel"))
     docker = _parse_docker(path, name, body.get("docker"))
+    gpu_lock = body.get("gpu_lock")
+    if gpu_lock is not None:
+        try:
+            validate_gpu_lock(gpu_lock)
+        except ValueError as exc:
+            raise ConfigError(f"{path}: profile '{name}' {exc}") from exc
+    deny_gpus = body.get("deny_gpus", [])
+    if not isinstance(deny_gpus, list) or any(
+        type(index) is not int or index < 0 for index in deny_gpus
+    ):
+        raise ConfigError(f"{path}: profile '{name}' deny_gpus must be an array of GPU indices")
 
     return Profile(
         host=body["host"],
@@ -130,8 +144,20 @@ def _parse_profile(path: Path, name: str, body: dict[str, Any]) -> Profile:
         keep_remote=keep_remote,
         tunnel=tunnel,
         docker=docker,
+        gpu_lock=gpu_lock,
+        deny_gpus=tuple(deny_gpus),
         **optional,
     )
+
+
+def validate_gpu_lock(template: str) -> None:
+    if (
+        not isinstance(template, str)
+        or not template.startswith("/")
+        or "{N}" not in template.rsplit("/", 1)[-1]
+        or "\x00" in template
+    ):
+        raise ValueError("GPU lock path must be absolute and contain {N} in its filename")
 
 
 def _parse_env(path: Path, name: str, raw: Any) -> dict[str, str]:

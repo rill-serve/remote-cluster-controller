@@ -63,6 +63,10 @@ def config(
         typer.echo("}")
     if resolved.keep_remote:
         typer.echo(f"keep_remote = {resolved.keep_remote!r}")
+    if resolved.gpu_lock is not None:
+        typer.echo(f"gpu_lock = {resolved.gpu_lock!r}")
+    if resolved.deny_gpus:
+        typer.echo(f"deny_gpus = {list(resolved.deny_gpus)!r}")
     if resolved.tunnel is not None:
         typer.echo(
             f"tunnel = {{ remote_port={resolved.tunnel.remote_port}, "

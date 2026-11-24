@@ -43,10 +43,7 @@ def build_rsync_argv(
     source_trailing_slash: bool = True,
     verbose: bool | None = None,
 ) -> list[str]:
-    # The stats2 block is always emitted: even quiet runs parse it into a
-    # one-line summary (issue #6). progress2 renders live under --verbose.
-    # When verbose, also ask rsync for its own per-file detail so "present all"
-    # means the full file list, not just a progress bar.
+    # Quiet transfers only need the stats block to build their summary.
     if verbose is None:
         from rcc.context import is_verbose
 
@@ -56,7 +53,7 @@ def build_rsync_argv(
         "-a",
         "-z",
         "--human-readable",
-        "--info=stats2,progress2",
+        "--info=stats2,progress2" if verbose else "--info=stats2",
         "--partial",
     ]
     if verbose:
@@ -159,7 +156,8 @@ def run_rsync_dry_run(argv: list[str]) -> DryRunSummary:
     result = subprocess.run(argv, capture_output=True, text=True)
     if result.returncode != 0:
         raise RemoteError(
-            f"rsync exited with code {result.returncode}", exit_code=result.returncode
+            _rsync_error_message(result.returncode, result.stderr),
+            exit_code=result.returncode,
         )
     return classify_dry_run_output(result.stdout)
 

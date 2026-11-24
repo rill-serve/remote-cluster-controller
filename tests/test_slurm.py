@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 from unittest.mock import patch
 
 import pytest
@@ -59,8 +60,8 @@ def test_submit_argv_combined_order():
 def test_squeue_script_uses_user_and_fixed_format():
     s = slurm.squeue_script()
     assert "id -un" in s
+    assert "squeue -h " in s
     assert "--format=" in s
-    assert slurm.SQUEUE_FORMAT in s
 
 
 def test_sacct_argv_uses_jobid_and_format():
@@ -106,6 +107,7 @@ def test_ensure_slurm_ok():
 def test_ensure_slurm_raises_when_missing():
     with patch("rcc.slurm.run_remote_capture") as cap:
         cap.return_value.returncode = 1
+        cap.return_value.stderr = ""
         with pytest.raises(RemoteError) as ei:
             slurm.ensure_slurm(make_profile(host="gpu-cluster"))
         assert ei.value.exit_code == 127
@@ -169,11 +171,25 @@ def test_submit_wait_streams_and_propagates_exit_code():
         cap.assert_not_called()
 
 
-def test_list_runs_squeue_script():
-    with patch("rcc.slurm.run_remote") as run, patch("rcc.slurm.ensure_slurm"):
-        run.return_value = 0
+def test_list_prints_running_job_once(capsys):
+    output = "\n".join([
+        "cluster:",
+        "\x1f".join([
+            "73024", "build|test", "normal", "RUNNING", "7:59", "nid[001,003]",
+            "None", "1:30:00", "2026-07-03T17:13:40", "", "a-infra", "2026-07-03T17:00:00", "2",
+        ]),
+    ])
+    result = subprocess.CompletedProcess([], 0, output, "")
+    with (
+        patch("rcc.slurm.run_remote_capture", return_value=result) as cap,
+        patch("rcc.slurm.ensure_slurm"),
+    ):
         assert slurm.list_jobs(make_profile()) == 0
-        assert run.call_args.kwargs["script"] == slurm.squeue_script()
+        assert cap.call_args.kwargs["script"] == slurm.squeue_script()
+    assert capsys.readouterr().out.splitlines() == [
+        "JobID,Name,Partition,State,Time,NodeList",
+        '73024,build|test,normal,RUNNING,7:59,"nid[001,003]"',
+    ]
 
 
 def test_status_runs_sacct():
@@ -188,6 +204,15 @@ def test_cancel_runs_scancel():
         run.return_value = 0
         slurm.cancel(make_profile(), "9")
         assert run.call_args.args[1] == ["scancel", "9"]
+
+
+@pytest.mark.parametrize("dependency", ["afterok:42?afterany:43", ""])
+def test_update_passes_dependency_to_scontrol(dependency):
+    with patch("rcc.slurm.run_remote", return_value=3) as run, patch("rcc.slurm.ensure_slurm"):
+        assert slurm.update(make_profile(), "9_2", dependency) == 3
+        assert run.call_args.args[1] == [
+            "scontrol", "update", "JobId=9_2", f"Dependency={dependency}"
+        ]
 
 
 def test_tail_does_not_detect_slurm():

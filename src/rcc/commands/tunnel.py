@@ -33,7 +33,7 @@ def tunnel(
     host: str | None = typer.Option(None, "--host"),
     remote_dir: str | None = typer.Option(None, "--remote-dir"),
 ) -> None:
-    """Open a local port-forward to the remote, reusing rcc's ControlMaster.
+    """Open a local port-forward to the remote, reusing the SSH ControlMaster.
 
     Replaces the manual ``ssh -L 8080:head:8080 host`` tail every workflow ends
     with (issue #2 P3). Defaults come from the profile's ``[tunnel]`` table, so
@@ -65,7 +65,7 @@ def tunnel(
     argv = build_ssh_local_forward_args(resolved, local_port=lp, remote_port=rp, remote_host=rh)
     typer.echo(
         f"Forwarding local {lp} -> {resolved.host}:{rh}:{rp} "
-        "(Ctrl-C to close). Reuses rcc's ControlMaster."
+        "(Ctrl-C to close). Reuses the SSH ControlMaster."
     )
 
     try:

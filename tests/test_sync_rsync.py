@@ -462,8 +462,7 @@ def test_build_rsync_argv_verbose_adds_rsync_v(tmp_path: Path, _no_verbose):
         verbose=True,
     )
     assert "-v" in verbose
-    # the stats/progress info stays on in both modes (quiet parses stats2)
-    assert "--info=stats2,progress2" in quiet
+    assert "--info=stats2" in quiet
     assert "--info=stats2,progress2" in verbose
 
 

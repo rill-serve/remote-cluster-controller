@@ -62,6 +62,7 @@ def list_jobs(
     json_output: bool = typer.Option(
         False, "--json", help="Emit a JSON array of {JobID, Name, Partition, State, ...}."
     ),
+    start: bool = typer.Option(False, "--start", help="Include Slurm's pending job start estimates."),
     profile: str | None = typer.Option(None, "--profile"),
     host: str | None = typer.Option(None, "--host"),
     remote_dir: str | None = typer.Option(None, "--remote-dir"),
@@ -69,12 +70,31 @@ def list_jobs(
     """List your Slurm jobs (squeue)."""
     resolved = _resolve(profile, host, remote_dir)
     if json_output:
-        rows = slurm.list_jobs_json(resolved)
+        rows = slurm.list_jobs_json(resolved, start=start)
         typer.echo(json.dumps(rows, indent=2))
         return
-    code = slurm.list_jobs(resolved)
+    code = slurm.list_jobs(resolved, start=start)
     if code != 0:
         raise RemoteError("squeue exited non-zero", exit_code=code)
+
+
+def update(
+    job_id: str = typer.Argument(..., help="Slurm JOBID."),
+    dependency: str = typer.Option(
+        ...,
+        "--dependency",
+        metavar="TYPE:JOBID",
+        help="Replace the job dependency. Pass an empty string to clear it.",
+    ),
+    profile: str | None = typer.Option(None, "--profile"),
+    host: str | None = typer.Option(None, "--host"),
+    remote_dir: str | None = typer.Option(None, "--remote-dir"),
+) -> None:
+    """Update an existing job's dependency (scontrol update)."""
+    resolved = _resolve(profile, host, remote_dir)
+    code = slurm.update(resolved, job_id, dependency)
+    if code != 0:
+        raise RemoteError("scontrol update exited non-zero", exit_code=code)
 
 
 def status(

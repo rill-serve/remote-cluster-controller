@@ -229,13 +229,14 @@ def test_cli_job_wait_success(rcc_project: Path, monkeypatch):
 def test_cli_job_list_json(rcc_project: Path, monkeypatch):
     monkeypatch.chdir(rcc_project)
     rows = [
-        {"JobID": "12345", "Name": "train", "State": "RUNNING", "ok": False},
+        {"JobID": "12345", "Name": "train", "State": "RUNNING", "ok": None},
     ]
-    with patch("rcc.slurm.list_jobs_json", return_value=rows):
-        result = runner.invoke(app, ["job", "list", "--json"])
+    with patch("rcc.slurm.list_jobs_json", return_value=rows) as list_fn:
+        result = runner.invoke(app, ["job", "list", "--json", "--start"])
         assert result.exit_code == 0, result.output
         payload = json.loads(result.output)
         assert payload == rows
+        assert list_fn.call_args.kwargs["start"] is True
 
 
 def test_cli_job_list_json_empty(rcc_project: Path, monkeypatch):
@@ -246,17 +247,32 @@ def test_cli_job_list_json_empty(rcc_project: Path, monkeypatch):
         assert json.loads(result.output) == []
 
 
-def test_cli_job_list_text_mode_still_streams(rcc_project: Path, monkeypatch):
-    # Without --json, the existing streaming path is used (not list_jobs_json).
+def test_cli_job_list_start_text_mode_includes_estimate(rcc_project: Path, monkeypatch):
     monkeypatch.chdir(rcc_project)
+    queue = "12|train|gpu|PENDING|0:00||Priority|1:30|Unknown||a|16:00|1"
+    estimate = "12|18:00"
+    results = [
+        subprocess.CompletedProcess([], 0, row.replace("|", "\x1f"), "")
+        for row in (queue, estimate)
+    ]
     with (
-        patch("rcc.slurm.list_jobs", return_value=0) as stream_fn,
-        patch("rcc.slurm.list_jobs_json") as json_fn,
+        patch("rcc.slurm.ensure_slurm"),
+        patch("rcc.slurm.run_remote_capture", side_effect=results),
     ):
-        result = runner.invoke(app, ["job", "list"])
-        assert result.exit_code == 0, result.output
-        stream_fn.assert_called_once()
-        json_fn.assert_not_called()
+        result = runner.invoke(app, ["job", "list", "--start"])
+    assert result.exit_code == 0, result.output
+    assert result.output.splitlines() == [
+        "JobID,Name,Partition,State,Time,NodeList,StartTime",
+        "12,train,gpu,PENDING,0:00,,18:00",
+    ]
+
+
+def test_cli_job_update_passes_dependency_and_propagates_exit_code(rcc_project: Path, monkeypatch):
+    monkeypatch.chdir(rcc_project)
+    with patch("rcc.slurm.update", return_value=4) as update_fn:
+        result = runner.invoke(app, ["job", "update", "12", "--dependency", "afterok:42"])
+    assert result.exit_code == 4
+    assert update_fn.call_args.args[1:] == ("12", "afterok:42")
 
 
 def test_cli_job_status_json(rcc_project: Path, monkeypatch):

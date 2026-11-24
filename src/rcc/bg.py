@@ -25,7 +25,7 @@ from dataclasses import dataclass
 
 from rcc.config import Profile
 from rcc.errors import RemoteError
-from rcc.ssh import run_remote, run_remote_capture
+from rcc.ssh import check_ssh_connection, run_remote, run_remote_capture
 
 SESSION_PREFIX = "rcc-"
 RUN_DIR = ".rcc-runs"  # relative to remote_dir
@@ -177,11 +177,17 @@ def attach_argv(name: str) -> list[str]:
 def ensure_tmux(profile: Profile) -> None:
     """Raise RemoteError (exit 127) if tmux is not on the remote PATH."""
     result = run_remote_capture(profile, ["command", "-v", "tmux"])
-    if result.returncode != 0:
+    check_ssh_connection(profile, result)
+    if result.returncode == 1 and not result.stderr.strip():
         raise RemoteError(
             f"tmux does not appear to be installed on {profile.host} "
             "(needed for detached runs). Install tmux on the remote.",
             exit_code=127,
+        )
+    if result.returncode:
+        raise RemoteError(
+            result.stderr.strip() or f"could not check for tmux on {profile.host}",
+            exit_code=result.returncode,
         )
 
 

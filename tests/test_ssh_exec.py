@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import socket
 import subprocess
 from unittest.mock import patch
 
@@ -7,7 +8,10 @@ import pytest
 
 from rcc.config import DockerSpec, Profile
 from rcc.errors import MissingDependencyError, RemoteError
+from rcc.slurm import ensure_slurm
 from rcc.ssh import (
+    build_rsync_e_string,
+    build_ssh_local_forward_args,
     ensure_remote_dir,
     mux_check,
     mux_exit,
@@ -42,6 +46,66 @@ def test_run_remote_invokes_ssh(fake_run):
     assert argv[-2] == "myhost"
     assert argv[-1].startswith("bash -lc ")
     assert "ls" in argv[-1]
+
+
+def test_reuse_user_controlmaster(fake_run, tmp_path):
+    control = tmp_path / "my socket"
+    with socket.socket(socket.AF_UNIX) as listener:
+        listener.bind(str(control))
+
+        def ssh(argv, **kwargs):
+            if "-G" in argv:
+                return subprocess.CompletedProcess(argv, 0, f"controlpath {control}\n")
+            return subprocess.CompletedProcess(argv, 0)
+
+        fake_run.side_effect = ssh
+        profile = make_profile(proxy_jump="gateway")
+        assert run_remote(profile, ["ls"]) == 0
+        probe, check, command = [call.args[0] for call in fake_run.call_args_list]
+        assert "-G" in probe
+        assert check[-3:] == ["-O", "check", profile.host]
+        assert command[-2] == profile.host
+        for argv in (probe, check, command):
+            assert "ProxyJump=gateway" in argv
+            assert "ControlMaster=no" in argv
+            assert not any(arg.startswith("ControlPath=") for arg in argv)
+        assert "ControlMaster=no" in build_rsync_e_string(profile)
+        assert "ControlMaster=no" in build_ssh_local_forward_args(
+            profile, local_port=9000, remote_port=8080
+        )
+        assert mux_check(profile, include_user=True)
+        mux_exit(profile)
+        assert "ControlPath=~/.ssh/controlmasters/%C" in fake_run.call_args.args[0]
+
+
+def test_stale_user_socket_falls_back_to_rcc(fake_run, tmp_path):
+    control = tmp_path / "stale"
+    with socket.socket(socket.AF_UNIX) as listener:
+        listener.bind(str(control))
+    fake_run.side_effect = [
+        subprocess.CompletedProcess([], 0, f"controlpath {control}\n"),
+        subprocess.CompletedProcess([], 255),
+        subprocess.CompletedProcess([], 0),
+    ]
+    assert run_remote(make_profile(), ["ls"]) == 0
+    assert "ControlPath=~/.ssh/controlmasters/%C" in fake_run.call_args.args[0]
+
+
+@pytest.mark.parametrize(
+    ("exit_code", "diagnostic", "message"),
+    [
+        (255, "myhost: Permission denied (keyboard-interactive).", "SSH authentication"),
+        (255, "ssh: connect to host myhost port 22: Connection refused", "SSH authentication"),
+        (1, "myhost: Permission denied (publickey).", "SSH authentication"),
+        (1, "error: remote directory does not exist: /srv/app", "could not check Slurm"),
+    ],
+)
+def test_slurm_probe_preserves_connection_or_remote_error(fake_run, exit_code, diagnostic, message):
+    fake_run.return_value = subprocess.CompletedProcess([], exit_code, "", diagnostic)
+    with pytest.raises(RemoteError, match=message) as err:
+        ensure_slurm(make_profile())
+    assert err.value.exit_code == exit_code
+    assert diagnostic in str(err.value)
 
 
 def test_run_remote_quotes_remote_script_as_single_ssh_command(fake_run):
